@@ -1,3 +1,6 @@
+<img width="1456" height="819" alt="image" src="https://github.com/user-attachments/assets/ca04455a-648c-4ffd-90da-a95f24741eef" />
+
+
 # BOTICS ALPHA — AI Vision Pipeline
 
 On-device AI vision pipeline for the BOTICS Alpha robotics competition:

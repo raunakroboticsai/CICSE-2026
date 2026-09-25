@@ -20,8 +20,8 @@ int SPEED = 150;
 #define SLOW_SPEED 90
 
 float COUNTS_PER_MM    = 10.34;  // bigger = longer moves
-float STRAFE_FACTOR    = 1.14;   // strafe correction
-float TURN_90_WHEEL_MM = 281;    // 90 degree turn
+float STRAFE_FACTOR    = 0.95;   // strafe correction (was 1.14)
+float TURN_90_WHEEL_MM = 240;    // 90 degree turn (was 281)
 
 // ---------------- your verified motor functions ----------------
 void motor1(int speed) {
@@ -145,7 +145,7 @@ void mission1() {
 
   goRight(210);        // leave start zone
   goForward(243);
-  goRotateRight(90);   // face the lab (bottom wall)  <-- FIXED (was goRotateLeft)
+  goRotateRight(90);   // face the lab (bottom wall)
   goRight(375);        // quarantine side
   goBackward(25);
   wait(1600);          // camera scan

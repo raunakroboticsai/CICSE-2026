@@ -1,0 +1,56 @@
+M1 ENCODER 	D40, D41
+M2 ENCODER 	D42, D43
+M3 ENCODER 	D44, D45
+M4 ENCODER 	D46, D47
+
+#define M1_PWM  2
+#define M1_IN1  31
+#define M1_IN2  30
+
+#define M2_PWM  3
+#define M2_IN1  32
+#define M2_IN2  33
+
+
+// ---------- U3 ----------
+#define M3_PWM  4
+#define M3_IN1  35
+#define M3_IN2  34
+
+#define M4_PWM  5
+#define M4_IN1  36
+#define M4_IN2  37
+
+Final confirmed mapping
+Motor	Location
+M1	Front Left (FL)
+M2	Rear Left (RL)
+M3	Front Right (FR)
+M4	Rear Right (RR)
+
+
+
+
+
+
+
+               FRONT
+        ┌───────────────────┐
+        │                   │
+        │  M1           M3  │
+        │ FRONT LEFT   FRONT RIGHT
+        │                   │
+        │                   │
+        │  M2           M4  │
+        │ REAR LEFT    REAR RIGHT
+        │                   │
+        └───────────────────┘
+                   REAR
+
+
+| Motor  | Location         |
+| ------ | ---------------- |
+| **M1** | Front Left (FL)  |
+| **M2** | Rear Left (RL)   |
+| **M3** | Front Right (FR) |
+| **M4** | Rear Right (RR)  |

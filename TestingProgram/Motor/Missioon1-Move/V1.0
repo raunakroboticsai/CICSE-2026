@@ -1,0 +1,203 @@
+// MISSION 1 - ENCODER BASED - Robot 1 (BOTICS ALPHA ST68)
+// Motor directions = your verified Motortest code (unchanged)
+// START: robot 783 mm from LEFT wall, 140 mm from BOTTOM wall,
+//        FRONT facing LEFT (quarantine zone). Press RESET.
+
+#define M1_PWM 2
+#define M1_IN1 31
+#define M1_IN2 30
+#define M2_PWM 3
+#define M2_IN1 32
+#define M2_IN2 33
+#define M3_PWM 4
+#define M3_IN1 35
+#define M3_IN2 34
+#define M4_PWM 5
+#define M4_IN1 36
+#define M4_IN2 37
+
+int SPEED = 150;
+#define SLOW_SPEED 90
+
+float COUNTS_PER_MM    = 10.34;  // bigger = longer moves
+float STRAFE_FACTOR    = 1.14;   // strafe correction
+float TURN_90_WHEEL_MM = 281;    // 90 degree turn
+
+// ---------------- your verified motor functions ----------------
+void motor1(int speed) {
+  if (speed > 0)      { digitalWrite(M1_IN1, HIGH); digitalWrite(M1_IN2, LOW); }
+  else if (speed < 0) { digitalWrite(M1_IN1, LOW);  digitalWrite(M1_IN2, HIGH); }
+  else                { digitalWrite(M1_IN1, LOW);  digitalWrite(M1_IN2, LOW); }
+  analogWrite(M1_PWM, abs(speed));
+}
+void motor2(int speed) {
+  if (speed > 0)      { digitalWrite(M2_IN1, HIGH); digitalWrite(M2_IN2, LOW); }
+  else if (speed < 0) { digitalWrite(M2_IN1, LOW);  digitalWrite(M2_IN2, HIGH); }
+  else                { digitalWrite(M2_IN1, LOW);  digitalWrite(M2_IN2, LOW); }
+  analogWrite(M2_PWM, abs(speed));
+}
+void motor3(int speed) {
+  if (speed > 0)      { digitalWrite(M3_IN1, HIGH); digitalWrite(M3_IN2, LOW); }
+  else if (speed < 0) { digitalWrite(M3_IN1, LOW);  digitalWrite(M3_IN2, HIGH); }
+  else                { digitalWrite(M3_IN1, LOW);  digitalWrite(M3_IN2, LOW); }
+  analogWrite(M3_PWM, abs(speed));
+}
+void motor4(int speed) {
+  if (speed > 0)      { digitalWrite(M4_IN1, HIGH); digitalWrite(M4_IN2, LOW); }
+  else if (speed < 0) { digitalWrite(M4_IN1, LOW);  digitalWrite(M4_IN2, HIGH); }
+  else                { digitalWrite(M4_IN1, LOW);  digitalWrite(M4_IN2, LOW); }
+  analogWrite(M4_PWM, abs(speed));
+}
+void stopMotors() { motor1(0); motor2(0); motor3(0); motor4(0); }
+
+void forward()     { motor1(SPEED);  motor2(SPEED);  motor3(SPEED);  motor4(SPEED);  }
+void backward()    { motor1(-SPEED); motor2(-SPEED); motor3(-SPEED); motor4(-SPEED); }
+void strafeRight() { motor1(SPEED);  motor2(-SPEED); motor3(-SPEED); motor4(SPEED);  }
+void strafeLeft()  { motor1(-SPEED); motor2(SPEED);  motor3(SPEED);  motor4(-SPEED); }
+void rotateRight() { motor1(-SPEED); motor2(-SPEED); motor3(SPEED);  motor4(SPEED);  }
+void rotateLeft()  { motor1(SPEED);  motor2(SPEED);  motor3(-SPEED); motor4(-SPEED); }
+
+// ---------------- encoders D40-D47 (Timer1, 20 kHz) ----------------
+volatile long enc[4];
+byte encPrev[4];
+const signed char QDEC[16] = {0,-1,1,0, 1,0,0,-1, -1,0,0,1, 0,1,-1,0};
+
+void encStep(byte m, byte now) {
+  enc[m] = enc[m] + QDEC[encPrev[m] * 4 + now];
+  encPrev[m] = now;
+}
+
+ISR(TIMER1_COMPA_vect) {
+  byte g = PING;
+  byte l = PINL;
+  encStep(0, g & 3);          // M1 D40 D41
+  encStep(1, (l / 64) & 3);   // M2 D42 D43
+  encStep(2, (l / 16) & 3);   // M3 D44 D45
+  encStep(3, (l / 4) & 3);    // M4 D46 D47
+}
+
+void encodersBegin() {
+  for (int p = 40; p <= 47; p++) pinMode(p, INPUT_PULLUP);
+  delay(5);
+  byte g = PING;
+  byte l = PINL;
+  encPrev[0] = g & 3;
+  encPrev[1] = (l / 64) & 3;
+  encPrev[2] = (l / 16) & 3;
+  encPrev[3] = (l / 4) & 3;
+  noInterrupts();
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+  OCR1A = 799;
+  TCCR1B = bit(WGM12) | bit(CS10);
+  TIMSK1 = TIMSK1 | bit(OCIE1A);
+  interrupts();
+}
+
+long readEnc(int m) { noInterrupts(); long c = enc[m]; interrupts(); return c; }
+
+// ---------------- one move by encoder ----------------
+void brakeAll() {
+  digitalWrite(M1_IN1, HIGH); digitalWrite(M1_IN2, HIGH); analogWrite(M1_PWM, 255);
+  digitalWrite(M2_IN1, HIGH); digitalWrite(M2_IN2, HIGH); analogWrite(M2_PWM, 255);
+  digitalWrite(M3_IN1, HIGH); digitalWrite(M3_IN2, HIGH); analogWrite(M3_PWM, 255);
+  digitalWrite(M4_IN1, HIGH); digitalWrite(M4_IN2, HIGH); analogWrite(M4_PWM, 255);
+  delay(150);
+  stopMotors();
+}
+
+void encMove(void (*movement)(), float wheelMM) {
+  long start[4];
+  for (int m = 0; m < 4; m++) start[m] = readEnc(m);
+  float target = wheelMM * COUNTS_PER_MM;
+  float slowAt = target - 40 * COUNTS_PER_MM;
+  unsigned long t0 = millis();
+  unsigned long maxTime = 3000 + (unsigned long)(wheelMM * 12);
+  bool slow = false;
+
+  SPEED = 150;
+  movement();
+  while (true) {
+    long sum = 0;
+    for (int m = 0; m < 4; m++) sum += abs(readEnc(m) - start[m]);
+    float avg = sum / 4.0;
+    if (avg >= target) break;
+    if (!slow && avg >= slowAt) { SPEED = SLOW_SPEED; movement(); slow = true; }
+    if (millis() - t0 > maxTime) { Serial.println("TIMEOUT - check encoders"); break; }
+  }
+  brakeAll();
+  SPEED = 150;
+  delay(150);
+}
+
+void goForward(float mm)      { Serial.print("FORWARD ");  Serial.println(mm); encMove(forward, mm); }
+void goBackward(float mm)     { Serial.print("BACKWARD "); Serial.println(mm); encMove(backward, mm); }
+void goRight(float mm)        { Serial.print("RIGHT ");    Serial.println(mm); encMove(strafeRight, mm * STRAFE_FACTOR); }
+void goLeft(float mm)         { Serial.print("LEFT ");     Serial.println(mm); encMove(strafeLeft, mm * STRAFE_FACTOR); }
+void goRotateLeft(float deg)  { Serial.print("ROT LEFT "); Serial.println(deg); encMove(rotateLeft, TURN_90_WHEEL_MM * deg / 90); }
+void goRotateRight(float deg) { Serial.print("ROT RIGHT ");Serial.println(deg); encMove(rotateRight, TURN_90_WHEEL_MM * deg / 90); }
+void wait(unsigned long ms)   { stopMotors(); delay(ms); }
+
+// ---------------- MISSION 1 ----------------
+void mission1() {
+  wait(500);
+
+  goRight(210);        // leave start zone
+  goForward(243);
+  goRotateRight(90);   // face the lab (bottom wall)  <-- FIXED (was goRotateLeft)
+  goRight(375);        // quarantine side
+  goBackward(25);
+  wait(1600);          // camera scan
+
+  goLeft(43);          // sample 1
+  wait(1200);          // pick
+  goLeft(192);
+  goForward(100);      // lab slot 1
+  wait(700);           // place
+  goBackward(100);
+
+  goRight(230);        // sample 2
+  goForward(76);
+  wait(1300);          // pick
+  goBackward(76);
+  goLeft(303);
+  goForward(100);      // lab slot 2
+  wait(700);           // place
+  goBackward(100);
+
+  goRight(303);        // sample 3
+  goForward(103);
+  wait(1300);          // pick
+  goBackward(103);
+  goLeft(403);
+  goForward(100);      // lab slot 3
+  wait(700);           // place
+  goBackward(100);
+
+  goRight(413);        // quarantine construction
+  goForward(35);
+  goBackward(115);
+  goForward(55);
+  goBackward(25);      // deploy position
+  wait(1600);          // deploy beams
+  goBackward(30);      // FINISH
+
+  Serial.println("MISSION 1 FINISHED");
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(M1_PWM, OUTPUT); pinMode(M1_IN1, OUTPUT); pinMode(M1_IN2, OUTPUT);
+  pinMode(M2_PWM, OUTPUT); pinMode(M2_IN1, OUTPUT); pinMode(M2_IN2, OUTPUT);
+  pinMode(M3_PWM, OUTPUT); pinMode(M3_IN1, OUTPUT); pinMode(M3_IN2, OUTPUT);
+  pinMode(M4_PWM, OUTPUT); pinMode(M4_IN1, OUTPUT); pinMode(M4_IN2, OUTPUT);
+  stopMotors();
+  encodersBegin();
+  delay(2000);
+  mission1();
+  stopMotors();
+}
+
+void loop() {
+}

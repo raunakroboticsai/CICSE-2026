@@ -20,7 +20,8 @@ int SPEED = 150;
 #define SLOW_SPEED 90
 
 float COUNTS_PER_MM    = 10.34;  // encoder counts per mm (keep)
-float FORWARD_FACTOR   = 0.85;   // forward/backward correction (video 3: moves were 18 % too long)
+float FORWARD_FACTOR   = 0.85;   // forward correction  (video 4: good)
+float BACKWARD_FACTOR  = 0.80;   // backward correction (video 4: backward was ~8 % longer than forward)
 float STRAFE_FACTOR    = 1.05;   // strafe correction (was 0.95, video 3: strafes were 10 % too short)
 float TURN_90_WHEEL_MM = 240;    // 90 degree turn (good - unchanged)
 
@@ -133,7 +134,7 @@ void encMove(void (*movement)(), float wheelMM) {
 }
 
 void goForward(float mm)      { Serial.print("FORWARD ");  Serial.println(mm); encMove(forward, mm * FORWARD_FACTOR); }
-void goBackward(float mm)     { Serial.print("BACKWARD "); Serial.println(mm); encMove(backward, mm * FORWARD_FACTOR); }
+void goBackward(float mm)     { Serial.print("BACKWARD "); Serial.println(mm); encMove(backward, mm * BACKWARD_FACTOR); }
 void goRight(float mm)        { Serial.print("RIGHT ");    Serial.println(mm); encMove(strafeRight, mm * STRAFE_FACTOR); }
 void goLeft(float mm)         { Serial.print("LEFT ");     Serial.println(mm); encMove(strafeLeft, mm * STRAFE_FACTOR); }
 void goRotateLeft(float deg)  { Serial.print("ROT LEFT "); Serial.println(deg); encMove(rotateLeft, TURN_90_WHEEL_MM * deg / 90); }
@@ -147,7 +148,7 @@ void mission1() {
   goRight(210);        // leave start zone
   goForward(243);
   goRotateRight(90);   // face the lab (bottom wall)
-  goRight(375);        // quarantine side
+  goRight(400);        // quarantine side (video 4: robot stopped 25 mm short -> 375 + 25)
   goBackward(25);
   wait(1600);          // camera scan
 

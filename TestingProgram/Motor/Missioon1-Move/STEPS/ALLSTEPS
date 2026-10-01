@@ -1,0 +1,501 @@
+
+#define M1_PWM 2
+#define M1_IN1 31
+#define M1_IN2 30
+
+#define M2_PWM 3
+#define M2_IN1 32
+#define M2_IN2 33
+
+#define M3_PWM 4
+#define M3_IN1 35
+#define M3_IN2 34
+
+#define M4_PWM 5
+#define M4_IN1 36
+#define M4_IN2 37
+
+#define SPEED 150
+#define SLOW_SPEED 90
+
+#define COUNTS_PER_MM 10.34
+
+#define DIAGONAL_FACTOR 1.00
+#define STRAFE_FACTOR 1.05
+#define FORWARD_FACTOR 1.00
+#define BACKWARD_FACTOR 0.80
+
+#define TURN_90_WHEEL_MM 330
+
+volatile long enc[4] = {0, 0, 0, 0};
+byte encPrev[4] = {0, 0, 0, 0};
+
+const signed char QDEC[16] = {
+  0, -1, 1, 0,
+  1, 0, 0, -1,
+  -1, 0, 0, 1,
+  0, 1, -1, 0
+};
+
+enum MoveType {
+  DIAGONAL_FRONT_RIGHT,
+  ROTATE_RIGHT,
+  STRAFE_RIGHT,
+  BACKWARD,
+  STRAFE_LEFT,
+  FORWARD
+};
+
+void encStep(byte m, byte now) {
+  enc[m] += QDEC[encPrev[m] * 4 + now];
+  encPrev[m] = now;
+}
+
+ISR(TIMER1_COMPA_vect) {
+  byte g = PING;
+  byte l = PINL;
+
+  encStep(0, g & 0x03);
+  encStep(1, (l / 64) & 0x03);
+  encStep(2, (l / 16) & 0x03);
+  encStep(3, (l / 4) & 0x03);
+}
+
+void encodersBegin() {
+  for (byte pin = 40; pin <= 47; pin++) {
+    pinMode(pin, INPUT_PULLUP);
+  }
+
+  byte g = PING;
+  byte l = PINL;
+
+  encPrev[0] = g & 0x03;
+  encPrev[1] = (l / 64) & 0x03;
+  encPrev[2] = (l / 16) & 0x03;
+  encPrev[3] = (l / 4) & 0x03;
+
+  noInterrupts();
+
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+
+  OCR1A = 799;
+
+  TCCR1B |= (1 << WGM12);
+  TCCR1B |= (1 << CS10);
+  TIMSK1 |= (1 << OCIE1A);
+
+  interrupts();
+}
+
+void readEnc(long result[4]) {
+  noInterrupts();
+
+  for (byte i = 0; i < 4; i++) {
+    result[i] = enc[i];
+  }
+
+  interrupts();
+}
+
+void resetEncoders() {
+  noInterrupts();
+
+  for (byte i = 0; i < 4; i++) {
+    enc[i] = 0;
+  }
+
+  interrupts();
+}
+
+void motorRun(byte pwm, byte in1, byte in2, int speed) {
+  speed = constrain(speed, -255, 255);
+
+  if (speed > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+    analogWrite(pwm, speed);
+  }
+  else if (speed < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    analogWrite(pwm, -speed);
+  }
+  else {
+    analogWrite(pwm, 0);
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+}
+
+void stopMotors() {
+  motorRun(M1_PWM, M1_IN1, M1_IN2, 0);
+  motorRun(M2_PWM, M2_IN1, M2_IN2, 0);
+  motorRun(M3_PWM, M3_IN1, M3_IN2, 0);
+  motorRun(M4_PWM, M4_IN1, M4_IN2, 0);
+}
+
+void brakeAll() {
+  digitalWrite(M1_IN1, HIGH);
+  digitalWrite(M1_IN2, HIGH);
+
+  digitalWrite(M2_IN1, HIGH);
+  digitalWrite(M2_IN2, HIGH);
+
+  digitalWrite(M3_IN1, HIGH);
+  digitalWrite(M3_IN2, HIGH);
+
+  digitalWrite(M4_IN1, HIGH);
+  digitalWrite(M4_IN2, HIGH);
+
+  analogWrite(M1_PWM, 255);
+  analogWrite(M2_PWM, 255);
+  analogWrite(M3_PWM, 255);
+  analogWrite(M4_PWM, 255);
+
+  delay(150);
+  stopMotors();
+}
+
+void runMovement(MoveType type, int spd) {
+  switch (type) {
+    case DIAGONAL_FRONT_RIGHT:
+      motorRun(M1_PWM, M1_IN1, M1_IN2, spd);
+      motorRun(M2_PWM, M2_IN1, M2_IN2, 0);
+      motorRun(M3_PWM, M3_IN1, M3_IN2, 0);
+      motorRun(M4_PWM, M4_IN1, M4_IN2, spd);
+      break;
+
+    case ROTATE_RIGHT:
+      motorRun(M1_PWM, M1_IN1, M1_IN2, -spd);
+      motorRun(M2_PWM, M2_IN1, M2_IN2, -spd);
+      motorRun(M3_PWM, M3_IN1, M3_IN2, spd);
+      motorRun(M4_PWM, M4_IN1, M4_IN2, spd);
+      break;
+
+    case STRAFE_RIGHT:
+      motorRun(M1_PWM, M1_IN1, M1_IN2, spd);
+      motorRun(M2_PWM, M2_IN1, M2_IN2, -spd);
+      motorRun(M3_PWM, M3_IN1, M3_IN2, -spd);
+      motorRun(M4_PWM, M4_IN1, M4_IN2, spd);
+      break;
+
+    case BACKWARD:
+      motorRun(M1_PWM, M1_IN1, M1_IN2, -spd);
+      motorRun(M2_PWM, M2_IN1, M2_IN2, -spd);
+      motorRun(M3_PWM, M3_IN1, M3_IN2, -spd);
+      motorRun(M4_PWM, M4_IN1, M4_IN2, -spd);
+      break;
+
+    case STRAFE_LEFT:
+      motorRun(M1_PWM, M1_IN1, M1_IN2, -spd);
+      motorRun(M2_PWM, M2_IN1, M2_IN2, spd);
+      motorRun(M3_PWM, M3_IN1, M3_IN2, spd);
+      motorRun(M4_PWM, M4_IN1, M4_IN2, -spd);
+      break;
+
+    case FORWARD:
+      motorRun(M1_PWM, M1_IN1, M1_IN2, spd);
+      motorRun(M2_PWM, M2_IN1, M2_IN2, spd);
+      motorRun(M3_PWM, M3_IN1, M3_IN2, spd);
+      motorRun(M4_PWM, M4_IN1, M4_IN2, spd);
+      break;
+  }
+}
+
+bool encoderMove(float mm, float factor, MoveType type, float slowDistance) {
+  resetEncoders();
+
+  float targetCounts = mm * factor * COUNTS_PER_MM;
+
+  unsigned long startTime = millis();
+  unsigned long timeout = 3000UL + (unsigned long)(mm * 12.0);
+
+  long current[4] = {0, 0, 0, 0};
+  float progress = 0;
+
+  while (progress < targetCounts) {
+    readEnc(current);
+
+    if (type == DIAGONAL_FRONT_RIGHT) {
+      progress = (abs(current[0]) + abs(current[3])) / 2.0;
+    }
+    else {
+      progress = (
+        abs(current[0]) +
+        abs(current[1]) +
+        abs(current[2]) +
+        abs(current[3])
+      ) / 4.0;
+    }
+
+    float remaining = targetCounts - progress;
+    int currentSpeed = SPEED;
+
+    if (remaining <= slowDistance * COUNTS_PER_MM) {
+      currentSpeed = SLOW_SPEED;
+    }
+
+    runMovement(type, currentSpeed);
+
+    if (millis() - startTime > timeout) {
+      stopMotors();
+      Serial.println("ERROR: MOVEMENT TIMEOUT");
+      return false;
+    }
+  }
+
+  stopMotors();
+  delay(200);
+
+  return true;
+}
+
+bool executeStep(
+  byte stepNumber,
+  const char *stepName,
+  float mm,
+  float factor,
+  MoveType type,
+  float slowDistance
+) {
+  Serial.print("STEP ");
+  Serial.print(stepNumber);
+  Serial.print(": ");
+  Serial.println(stepName);
+
+  bool success = encoderMove(
+    mm,
+    factor,
+    type,
+    slowDistance
+  );
+
+  if (!success) {
+    stopMotors();
+
+    Serial.print("STOPPED: STEP ");
+    Serial.print(stepNumber);
+    Serial.println(" FAILED");
+
+    return false;
+  }
+
+  Serial.print("STEP ");
+  Serial.print(stepNumber);
+  Serial.println(" COMPLETE");
+
+  delay(300);
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(M1_PWM, OUTPUT);
+  pinMode(M1_IN1, OUTPUT);
+  pinMode(M1_IN2, OUTPUT);
+
+  pinMode(M2_PWM, OUTPUT);
+  pinMode(M2_IN1, OUTPUT);
+  pinMode(M2_IN2, OUTPUT);
+
+  pinMode(M3_PWM, OUTPUT);
+  pinMode(M3_IN1, OUTPUT);
+  pinMode(M3_IN2, OUTPUT);
+
+  pinMode(M4_PWM, OUTPUT);
+  pinMode(M4_IN1, OUTPUT);
+  pinMode(M4_IN2, OUTPUT);
+
+  stopMotors();
+  encodersBegin();
+
+  Serial.println("MISSION 2 START");
+  Serial.println("BOTICS ALPHA ST68");
+
+  delay(1000);
+
+  if (!executeStep(
+        1,
+        "DIAGONAL FRONT RIGHT 900 mm",
+        900,
+        DIAGONAL_FACTOR,
+        DIAGONAL_FRONT_RIGHT,
+        40
+      )) return;
+
+  if (!executeStep(
+        2,
+        "ROTATE RIGHT 90 DEGREES",
+        TURN_90_WHEEL_MM,
+        1.0,
+        ROTATE_RIGHT,
+        40
+      )) return;
+
+  if (!executeStep(
+        3,
+        "STRAFE RIGHT 600 mm",
+        600,
+        STRAFE_FACTOR,
+        STRAFE_RIGHT,
+        40
+      )) return;
+
+  if (!executeStep(
+        4,
+        "BACKWARD 20 mm",
+        20,
+        BACKWARD_FACTOR,
+        BACKWARD,
+        10
+      )) return;
+
+  delay(500);
+
+  if (!executeStep(
+        5,
+        "STRAFE LEFT 240 mm",
+        240,
+        STRAFE_FACTOR,
+        STRAFE_LEFT,
+        10
+      )) return;
+
+  if (!executeStep(
+        7,
+        "FORWARD 100 mm",
+        80,
+        FORWARD_FACTOR,
+        FORWARD,
+        10
+      )) return;
+
+  delay(1000);
+
+  if (!executeStep(
+        8,
+        "BACKWARD 100 mm",
+        100,
+        BACKWARD_FACTOR,
+        BACKWARD,
+        10
+      )) return;
+
+  if (!executeStep(
+        9,
+        "STRAFE RIGHT 230 mm",
+        240,
+        STRAFE_FACTOR,
+        STRAFE_RIGHT,
+        10
+      )) return;
+
+  delay(1000);
+
+  if (!executeStep(
+        12,
+        "STRAFE LEFT 350 mm",
+        350,
+        STRAFE_FACTOR,
+        STRAFE_LEFT,
+        10
+      )) return;
+
+  if (!executeStep(
+        13,
+        "FORWARD 100 mm",
+        100,
+        FORWARD_FACTOR,
+        FORWARD,
+        10
+      )) return;
+
+  delay(1000);
+
+  if (!executeStep(
+        14,
+        "BACKWARD 100 mm",
+        100,
+        BACKWARD_FACTOR,
+        BACKWARD,
+        10
+      )) return;
+
+  if (!executeStep(
+        15,
+        "STRAFE RIGHT 303 mm",
+        350,
+        STRAFE_FACTOR,
+        STRAFE_RIGHT,
+        10
+      )) return;
+
+  delay(1000);
+
+  if (!executeStep(
+        18,
+        "STRAFE LEFT 600 mm",
+        600,
+        STRAFE_FACTOR,
+        STRAFE_LEFT,
+        10
+      )) return;
+
+  if (!executeStep(
+        19,
+        "FORWARD 100 mm",
+        100,
+        FORWARD_FACTOR,
+        FORWARD,
+        10
+      )) return;
+
+  delay(1000);
+
+  if (!executeStep(
+        20,
+        "BACKWARD 100 mm",
+        100,
+        BACKWARD_FACTOR,
+        BACKWARD,
+        10
+      )) return;
+
+  if (!executeStep(
+        21,
+        "STRAFE RIGHT 600 mm",
+        600,
+        STRAFE_FACTOR,
+        STRAFE_RIGHT,
+        10
+      )) return;
+
+  if (!executeStep(
+        22,
+        "FORWARD 35 mm",
+        35,
+        FORWARD_FACTOR,
+        FORWARD,
+        8
+      )) return;
+
+  if (!executeStep(
+        23,
+        "BACKWARD 115 mm",
+        80,
+        BACKWARD_FACTOR,
+        BACKWARD,
+        10
+      )) return;
+
+  stopMotors();
+
+  Serial.println("MISSION 2 MOVEMENT COMPLETE");
+  Serial.println("ALL STEPS FINISHED");
+}
+
+void loop() {
+}

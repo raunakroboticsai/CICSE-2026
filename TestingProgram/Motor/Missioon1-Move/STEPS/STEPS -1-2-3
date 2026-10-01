@@ -1,0 +1,457 @@
+
+// =====================================================
+// BOTICS ALPHA ST68
+// Arduino Mega 2560
+// 2x TB6612FNG Motor Drivers
+//
+// STEP 1: DIAGONAL FRONT RIGHT 900 mm
+// STEP 2: ROTATE RIGHT 90 DEGREES
+// STEP 3: STRAFE RIGHT 400 mm
+// =====================================================
+
+// ---------- MOTOR PINS ----------
+
+#define M1_PWM  2
+#define M1_IN1  31
+#define M1_IN2  30
+
+#define M2_PWM  3
+#define M2_IN1  32
+#define M2_IN2  33
+
+#define M3_PWM  4
+#define M3_IN1  35
+#define M3_IN2  34
+
+#define M4_PWM  5
+#define M4_IN1  36
+#define M4_IN2  37
+
+// ---------- SPEED ----------
+
+#define SPEED       150
+#define SLOW_SPEED   90
+
+// ---------- CALIBRATION ----------
+
+#define COUNTS_PER_MM      10.34
+#define DIAGONAL_FACTOR     1.00
+#define STRAFE_FACTOR       1.05
+#define TURN_90_WHEEL_MM  340
+
+// ---------- ENCODERS ----------
+
+volatile long enc[4] = {0, 0, 0, 0};
+byte encPrev[4];
+
+const signed char QDEC[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
+};
+
+void encStep(byte m, byte now) {
+  enc[m] += QDEC[encPrev[m] * 4 + now];
+  encPrev[m] = now;
+}
+
+// ---------- ENCODER INTERRUPT ----------
+
+ISR(TIMER1_COMPA_vect) {
+  byte g = PING;
+  byte l = PINL;
+
+  encStep(0, g & 3);
+  encStep(1, (l / 64) & 3);
+  encStep(2, (l / 16) & 3);
+  encStep(3, (l / 4) & 3);
+}
+
+// ---------- ENCODER SETUP ----------
+
+void encodersBegin() {
+  for (int p = 40; p <= 47; p++) {
+    pinMode(p, INPUT_PULLUP);
+  }
+
+  delay(5);
+
+  byte g = PING;
+  byte l = PINL;
+
+  encPrev[0] = g & 3;
+  encPrev[1] = (l / 64) & 3;
+  encPrev[2] = (l / 16) & 3;
+  encPrev[3] = (l / 4) & 3;
+
+  noInterrupts();
+
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+
+  OCR1A = 799;
+
+  TCCR1B = bit(WGM12) | bit(CS10);
+  TIMSK1 |= bit(OCIE1A);
+
+  interrupts();
+}
+
+// ---------- READ ENCODER ----------
+
+long readEnc(int m) {
+  noInterrupts();
+  long c = enc[m];
+  interrupts();
+
+  return c;
+}
+
+// ---------- MOTOR CONTROL ----------
+
+void motorRun(int pwm, int in1, int in2, int speed) {
+  if (speed > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  }
+  else if (speed < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+  }
+  else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+
+  analogWrite(pwm, abs(speed));
+}
+
+void motor1(int s) {
+  motorRun(M1_PWM, M1_IN1, M1_IN2, s);
+}
+
+void motor2(int s) {
+  motorRun(M2_PWM, M2_IN1, M2_IN2, s);
+}
+
+void motor3(int s) {
+  motorRun(M3_PWM, M3_IN1, M3_IN2, s);
+}
+
+void motor4(int s) {
+  motorRun(M4_PWM, M4_IN1, M4_IN2, s);
+}
+
+// ---------- STOP MOTORS ----------
+
+void stopMotors() {
+  motor1(0);
+  motor2(0);
+  motor3(0);
+  motor4(0);
+}
+
+// ---------- MOVEMENT DIRECTIONS ----------
+
+// Diagonal Front Right
+void diagonalFrontRight(int speed) {
+  motor1(speed);
+  motor2(0);
+  motor3(0);
+  motor4(speed);
+}
+
+// Rotate Right (Clockwise)
+void rotateRight(int speed) {
+  motor1(-speed);
+  motor2(-speed);
+  motor3(speed);
+  motor4(speed);
+}
+
+// Strafe Right
+void strafeRight(int speed) {
+  motor1(speed);
+  motor2(-speed);
+  motor3(-speed);
+  motor4(speed);
+}
+
+// ---------- BRAKE ----------
+
+void brakeAll() {
+  digitalWrite(M1_IN1, HIGH);
+  digitalWrite(M1_IN2, HIGH);
+  analogWrite(M1_PWM, 255);
+
+  digitalWrite(M2_IN1, HIGH);
+  digitalWrite(M2_IN2, HIGH);
+  analogWrite(M2_PWM, 255);
+
+  digitalWrite(M3_IN1, HIGH);
+  digitalWrite(M3_IN2, HIGH);
+  analogWrite(M3_PWM, 255);
+
+  digitalWrite(M4_IN1, HIGH);
+  digitalWrite(M4_IN2, HIGH);
+  analogWrite(M4_PWM, 255);
+
+  delay(150);
+
+  stopMotors();
+}
+
+// ---------- DIAGONAL MOVE ----------
+
+bool diagonalMove(float mm) {
+  long start1 = readEnc(0);
+  long start4 = readEnc(3);
+
+  float target = mm * DIAGONAL_FACTOR * COUNTS_PER_MM;
+  float slowAt = target - 40.0 * COUNTS_PER_MM;
+
+  bool slow = false;
+  bool reached = false;
+
+  unsigned long t0 = millis();
+  unsigned long maxTime = 3000UL + (unsigned long)(mm * 12);
+
+  Serial.println("STEP 1: DIAGONAL FRONT RIGHT START");
+
+  diagonalFrontRight(SPEED);
+
+  while (true) {
+    long c1 = abs(readEnc(0) - start1);
+    long c4 = abs(readEnc(3) - start4);
+
+    float avg = (c1 + c4) / 2.0;
+
+    if (avg >= target) {
+      Serial.println("DIAGONAL TARGET REACHED");
+      reached = true;
+      break;
+    }
+
+    if (!slow && avg >= slowAt) {
+      diagonalFrontRight(SLOW_SPEED);
+      slow = true;
+    }
+
+    if (millis() - t0 > maxTime) {
+      Serial.println("DIAGONAL TIMEOUT");
+      break;
+    }
+  }
+
+  brakeAll();
+
+  Serial.print("Diagonal M1 Counts: ");
+  Serial.println(abs(readEnc(0) - start1));
+
+  Serial.print("Diagonal M4 Counts: ");
+  Serial.println(abs(readEnc(3) - start4));
+
+  Serial.println("DIAGONAL STOPPED");
+
+  delay(500);
+
+  return reached;
+}
+
+// ---------- ROTATE RIGHT 90 ----------
+
+bool rotateRight90() {
+  long start[4];
+
+  for (int m = 0; m < 4; m++) {
+    start[m] = readEnc(m);
+  }
+
+  float target = TURN_90_WHEEL_MM * COUNTS_PER_MM;
+  float slowAt = target - 40.0 * COUNTS_PER_MM;
+
+  bool slow = false;
+  bool reached = false;
+
+  unsigned long t0 = millis();
+  unsigned long maxTime =
+    3000UL + (unsigned long)(TURN_90_WHEEL_MM * 12);
+
+  Serial.println("STEP 2: ROTATE RIGHT 90 START");
+
+  rotateRight(SPEED);
+
+  while (true) {
+    long c[4];
+
+    for (int m = 0; m < 4; m++) {
+      c[m] = abs(readEnc(m) - start[m]);
+    }
+
+    float avg = (c[0] + c[1] + c[2] + c[3]) / 4.0;
+
+    if (avg >= target) {
+      Serial.println("ROTATION TARGET REACHED");
+      reached = true;
+      break;
+    }
+
+    if (!slow && avg >= slowAt) {
+      rotateRight(SLOW_SPEED);
+      slow = true;
+    }
+
+    if (millis() - t0 > maxTime) {
+      Serial.println("ROTATION TIMEOUT");
+      break;
+    }
+  }
+
+  brakeAll();
+
+  Serial.println("----- ROTATION ENCODERS -----");
+
+  for (int m = 0; m < 4; m++) {
+    Serial.print("M");
+    Serial.print(m + 1);
+    Serial.print(" Counts: ");
+    Serial.println(abs(readEnc(m) - start[m]));
+  }
+
+  Serial.println("ROTATION STOPPED");
+
+  delay(500);
+
+  return reached;
+}
+
+// ---------- STRAFE RIGHT 400 mm ----------
+
+bool strafeMove(float mm) {
+  long start[4];
+
+  for (int m = 0; m < 4; m++) {
+    start[m] = readEnc(m);
+  }
+
+  float target = mm * STRAFE_FACTOR * COUNTS_PER_MM;
+  float slowAt = target - 40.0 * COUNTS_PER_MM;
+
+  bool slow = false;
+  bool reached = false;
+
+  unsigned long t0 = millis();
+  unsigned long maxTime =
+    3000UL + (unsigned long)(mm * 12);
+
+  Serial.println("STEP 3: STRAFE RIGHT START");
+
+  strafeRight(SPEED);
+
+  while (true) {
+    long c[4];
+
+    for (int m = 0; m < 4; m++) {
+      c[m] = abs(readEnc(m) - start[m]);
+    }
+
+    float avg = (c[0] + c[1] + c[2] + c[3]) / 4.0;
+
+    if (avg >= target) {
+      Serial.println("STRAFE TARGET REACHED");
+      reached = true;
+      break;
+    }
+
+    if (!slow && avg >= slowAt) {
+      strafeRight(SLOW_SPEED);
+      slow = true;
+    }
+
+    if (millis() - t0 > maxTime) {
+      Serial.println("STRAFE TIMEOUT");
+      break;
+    }
+  }
+
+  brakeAll();
+
+  Serial.println("----- STRAFE ENCODERS -----");
+
+  for (int m = 0; m < 4; m++) {
+    Serial.print("M");
+    Serial.print(m + 1);
+    Serial.print(" Counts: ");
+    Serial.println(abs(readEnc(m) - start[m]));
+  }
+
+  Serial.println("STRAFE RIGHT STOPPED");
+
+  delay(500);
+
+  return reached;
+}
+
+// ---------- SETUP ----------
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(M1_PWM, OUTPUT);
+  pinMode(M1_IN1, OUTPUT);
+  pinMode(M1_IN2, OUTPUT);
+
+  pinMode(M2_PWM, OUTPUT);
+  pinMode(M2_IN1, OUTPUT);
+  pinMode(M2_IN2, OUTPUT);
+
+  pinMode(M3_PWM, OUTPUT);
+  pinMode(M3_IN1, OUTPUT);
+  pinMode(M3_IN2, OUTPUT);
+
+  pinMode(M4_PWM, OUTPUT);
+  pinMode(M4_IN1, OUTPUT);
+  pinMode(M4_IN2, OUTPUT);
+
+  stopMotors();
+
+  encodersBegin();
+
+  Serial.println("BOTICS ALPHA ST68 READY");
+
+  delay(2000);
+
+  // STEP 1: DIAGONAL FRONT RIGHT 900 mm
+  if (!diagonalMove(900)) {
+    Serial.println("STOPPED: STEP 1 FAILED");
+    stopMotors();
+    return;
+  }
+
+  // STEP 2: ROTATE RIGHT 90 DEGREES
+  if (!rotateRight90()) {
+    Serial.println("STOPPED: STEP 2 FAILED");
+    stopMotors();
+    return;
+  }
+
+  // STEP 3: STRAFE RIGHT 400 mm
+  if (!strafeMove(600)) {
+    Serial.println("STOPPED: STEP 3 FAILED");
+    stopMotors();
+    return;
+  }
+
+  stopMotors();
+
+  Serial.println("ALL THREE STEPS FINISHED");
+}
+
+// ---------- LOOP ----------
+
+void loop() {
+  // All movements run once in setup().
+  // Robot remains stopped afterward.
+}

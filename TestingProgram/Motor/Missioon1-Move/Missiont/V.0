@@ -1,0 +1,3003 @@
+// ======================================================
+
+// MISSION 1 - FULL RUN
+
+// BOTICS ALPHA ST68
+
+// Mecanum drive (encoders) + PCA9685 arm + suction (pin 7)
+
+// + Grove Vision AI V2 (I2C) + slab servo
+
+//
+
+// SEQUENCE
+
+//   Diagonal front right 900 -> Rotate right 90 -> Strafe right 600
+
+//   -> Backward 20
+
+//   SAMPLE 1: camera scan + PICK
+
+//   Strafe left 240 -> Forward 80 -> PLACE -> Backward 100
+
+//   -> Strafe right 240
+
+//   SAMPLE 2: camera scan + PICK
+
+//   Strafe left 350 -> Forward 100 -> PLACE -> Backward 100
+
+//   -> Strafe right 350
+
+//   SAMPLE 3: camera scan + PICK
+
+//   Strafe left 600 -> Forward 100 -> PLACE -> Backward 100
+
+//   -> Strafe right 600 -> Forward 35 -> SLAB SERVO -> Backward 80
+
+//
+
+// START: the mission starts BY ITSELF 5 seconds after power-up
+
+//   (AUTO_START 1). Send any key during the countdown to cancel
+
+//   and stay in TEST mode.
+
+//
+
+// Serial Monitor: 115200 baud
+
+//   P = START mission (same as button on pin 22)
+
+//   X = STOP everything (works any time during the mission)
+
+//
+
+//   Tests while the robot is waiting (wheels do NOT move):
+
+//   K = scan + pick once        L = place once
+
+//   H = arm to scan pose        I = arm to INITIAL
+
+//   D = arm to PICK height      + / - = pick height 5 lower / higher
+
+//   W = show saved settings     S = suction ON/OFF
+
+//   B = slab servo test         ? = help
+
+//
+
+//   PICK AT THE SAMPLE'S COORDINATE (camera alignment):
+
+//   T = TEACH target: sample is exactly under the nozzle, camera
+
+//       remembers where it sees it (wheels do not move)
+
+//   C = CALIBRATE camera: robot moves 30 mm right and 30 mm forward
+
+//       and back, to learn how the picture moves (WHEELS MOVE)
+
+//   A = align test: robot moves so the sample is under the nozzle
+
+//   Z = forget T, C and the tuned pick height
+
+//   After T and C are done once, every pick in the mission first
+
+//   moves the robot onto the sample, picks, then moves back.
+
+//   T, C and the pick height are saved in the Mega (EEPROM).
+
+//
+
+// Library needed: Adafruit PWM Servo Driver
+
+// Close gv2_detect.py on the PC while this runs.
+
+// ======================================================
+
+
+
+#include <Wire.h>
+
+#include <EEPROM.h>
+
+#include <Adafruit_PWMServoDriver.h>
+
+
+
+// ======================================================
+
+// DRIVE MOTORS  (your pins and factors, unchanged)
+
+// ======================================================
+
+
+
+#define M1_PWM 2
+
+#define M1_IN1 31
+
+#define M1_IN2 30
+
+
+
+#define M2_PWM 3
+
+#define M2_IN1 32
+
+#define M2_IN2 33
+
+
+
+#define M3_PWM 4
+
+#define M3_IN1 35
+
+#define M3_IN2 34
+
+
+
+#define M4_PWM 5
+
+#define M4_IN1 36
+
+#define M4_IN2 37
+
+
+
+#define SPEED 150
+
+#define SLOW_SPEED 90
+
+
+
+#define COUNTS_PER_MM 10.34
+
+
+
+#define DIAGONAL_FACTOR 1.00
+
+#define STRAFE_FACTOR 1.05
+
+#define FORWARD_FACTOR 1.00
+
+#define BACKWARD_FACTOR 0.80
+
+
+
+#define TURN_90_WHEEL_MM 330
+
+
+
+// ======================================================
+
+// ARM  (PCA9685 0x40: base 0, lower arm 1, upper arm 2)
+
+// ======================================================
+
+
+
+#define BASE_SERVO    0
+
+#define BOTTOM_SERVO  1
+
+#define TOP_SERVO     2
+
+
+
+#define BASE_MIN    100
+
+#define BASE_MAX    560
+
+#define BOTTOM_MIN  150
+
+#define BOTTOM_MAX  510
+
+#define TOP_MIN     270
+
+#define TOP_MAX     530
+
+
+
+// Rest position when power is OFF
+
+#define IDLE_BASE      346
+
+#define IDLE_BOTTOM    500
+
+#define IDLE_TOP       300
+
+
+
+// Arm position while the robot drives to the quarantine zone
+
+#define INITIAL_BASE   350
+
+#define INITIAL_BOTTOM 370
+
+#define INITIAL_TOP    465
+
+
+
+// HOME / SCAN: camera faces down (your measured values).
+
+// The sample is also carried in this pose.
+
+#define SCAN_BASE      341
+
+#define SCAN_BOTTOM    290
+
+#define SCAN_TOP       375
+
+
+
+// PICK: arm straight down on the sample.
+
+// PICK_BOTTOM is NOT measured yet. Smaller = lower (150 = lowest).
+
+// 230 is a safe starting guess that should stop ABOVE the sample.
+
+// Tune it with D and - / + , then write the number here.
+
+// Base and upper arm stay the same as SCAN, so the arm goes
+
+// straight down from the scan pose.
+
+#define PICK_BASE      SCAN_BASE
+
+#define PICK_BOTTOM    165
+
+#define PICK_TOP       445
+
+
+
+// PLACE: same as pick, plus this many units higher
+
+// (0 = let go at the same height as the pick)
+
+#define PLACE_ABOVE_PICK  0
+
+
+
+// Arm speeds and pauses (ms)
+
+#define ARM_MOVE_MS     1200   // between scan / carry poses
+
+#define ARM_DOWN_MS     1500   // going down to pick / place
+
+#define PICK_DWELL_MS    800   // suction ON, wait to grab
+
+#define PLACE_DWELL_MS   800   // suction OFF, wait to let go
+
+
+
+// ======================================================
+
+// SUCTION (relay / MOSFET on Mega pin 7)
+
+// If the pump runs when it should be OFF, change to LOW.
+
+// ======================================================
+
+
+
+#define SUCTION_PIN  7
+
+#define SUCTION_ON   HIGH
+
+#define SUCTION_OFF  (SUCTION_ON == HIGH ? LOW : HIGH)
+
+
+
+// ======================================================
+
+// SLAB SERVO  (opens the slab near the end of the mission)
+
+// NOT CONFIGURED YET: I do not know its channel or values.
+
+// Fill in the three numbers, then change USE_SLAB_SERVO to 1.
+
+// Until then the robot only pauses at that step.
+
+// ======================================================
+
+
+
+#define USE_SLAB_SERVO   0
+
+#define SLAB_SERVO       3      // PCA9685 channel  (fill in)
+
+#define SLAB_CLOSED      300    // value when closed (fill in)
+
+#define SLAB_OPEN        450    // value when open   (fill in)
+
+#define SLAB_WAIT_MS     1000
+
+
+
+// ======================================================
+
+// VISION
+
+// ======================================================
+
+
+
+#define SAMPLE_TARGET_ID    3      // "sample" class in your model
+
+#define MIN_SCORE           50     // confidence 0-100
+
+#define CONFIRM_FRAMES      3      // frames in a row needed
+
+#define SCAN_TIMEOUT_MS     3000   // how long to look for a sample
+
+
+
+// 1 = if the camera does not see the sample, pick anyway
+
+//     (robot is already parked at the sample position)
+
+// 0 = if not seen, skip the pick
+#define PICK_IF_NOT_SEEN 0
+// ======================================================
+
+// CAMERA ALIGNMENT (pick at the coordinate the camera sees)
+
+// Works only after T (teach) and C (calibrate) were done once.
+
+// ======================================================
+
+
+
+#define ALIGN_ENABLE      1     // 0 = never align, always pick blind
+
+#define ALIGN_TOL_PX      6     // close enough (pixels)
+
+#define ALIGN_MAX_TRIES   3     // look-move rounds per pick
+
+#define ALIGN_MAX_MM      50    // never move further than this from the stop point
+
+#define ALIGN_MIN_MM      3     // ignore corrections smaller than this
+
+#define CAL_MOVE_MM       30    // distance used by C (calibrate)
+
+
+
+#define I2C_SDA_PIN       20
+
+#define I2C_SCL_PIN       21
+
+#define PCA9685_ADDR      0x40
+
+
+
+// ======================================================
+
+// START
+
+// ======================================================
+
+
+
+#define START_BUTTON_PIN 22     // button between pin 22 and GND
+
+
+
+// 1 = mission starts by itself after the countdown (like your
+
+//     movement code did). Any key during the countdown cancels it.
+
+// 0 = robot waits for P or the button.
+#define AUTO_START 0
+#define AUTO_START_DELAY_MS  5000
+
+
+
+// ======================================================
+
+// TYPES (kept above every function for the Arduino IDE)
+
+// ======================================================
+
+
+
+enum MoveType {
+
+  DIAGONAL_FRONT_RIGHT,
+
+  ROTATE_RIGHT,
+
+  STRAFE_RIGHT,
+
+  BACKWARD,
+
+  STRAFE_LEFT,
+
+  FORWARD
+
+};
+
+
+
+// Saved in EEPROM so tuning survives power off
+
+#define SETTINGS_MAGIC 0xB716
+
+
+
+struct Settings {
+
+  unsigned int magic;
+
+  int codePickBottom;   // PICK_BOTTOM in the code when this was saved
+
+  int pickBottom;       // tuned pick height
+
+  int targetX, targetY; // where the camera sees a sample that is under the nozzle
+
+  float sx, sy;         // picture shift (pixels) per 1 mm STRAFE RIGHT
+
+  float fx, fy;         // picture shift (pixels) per 1 mm FORWARD
+
+  byte targetSet;       // T done
+
+  byte calibrated;      // C done
+
+};
+
+
+
+Settings cfg;
+
+
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(PCA9685_ADDR);
+
+
+
+bool missionAborted = false;
+
+bool anyKeySeen = false;        // any key since power-up cancels AUTO_START
+
+bool suctionActive = false;
+
+byte stepCounter = 0;
+
+
+
+// ======================================================
+
+// STOP KEY: send X any time to stop the robot
+
+// ======================================================
+
+
+
+void stopMotors();
+
+
+
+bool abortRequested() {
+
+  while (Serial.available()) {
+
+    char c = Serial.read();
+
+    if (c != '\n' && c != '\r') {
+
+      anyKeySeen = true;
+
+    }
+
+    if (c == 'X' || c == 'x') {
+
+      missionAborted = true;
+
+    }
+
+  }
+
+
+
+  if (missionAborted) {
+
+    stopMotors();
+
+  }
+
+
+
+  return missionAborted;
+
+}
+
+
+
+// ======================================================
+
+// ENCODERS + MOTORS  (your code)
+
+// ======================================================
+
+
+
+volatile long enc[4] = {0, 0, 0, 0};
+
+byte encPrev[4] = {0, 0, 0, 0};
+
+
+
+const signed char QDEC[16] = {
+
+  0, -1, 1, 0,
+
+  1, 0, 0, -1,
+
+  -1, 0, 0, 1,
+
+  0, 1, -1, 0
+
+};
+
+
+
+void encStep(byte m, byte now) {
+
+  enc[m] += QDEC[encPrev[m] * 4 + now];
+
+  encPrev[m] = now;
+
+}
+
+
+
+ISR(TIMER1_COMPA_vect) {
+
+  byte g = PING;
+
+  byte l = PINL;
+
+
+
+  encStep(0, g & 0x03);
+
+  encStep(1, (l / 64) & 0x03);
+
+  encStep(2, (l / 16) & 0x03);
+
+  encStep(3, (l / 4) & 0x03);
+
+}
+
+
+
+void encodersBegin() {
+
+  for (byte pin = 40; pin <= 47; pin++) {
+
+    pinMode(pin, INPUT_PULLUP);
+
+  }
+
+
+
+  byte g = PING;
+
+  byte l = PINL;
+
+
+
+  encPrev[0] = g & 0x03;
+
+  encPrev[1] = (l / 64) & 0x03;
+
+  encPrev[2] = (l / 16) & 0x03;
+
+  encPrev[3] = (l / 4) & 0x03;
+
+
+
+  noInterrupts();
+
+
+
+  TCCR1A = 0;
+
+  TCCR1B = 0;
+
+  TCNT1 = 0;
+
+
+
+  OCR1A = 799;
+
+
+
+  TCCR1B |= (1 << WGM12);
+
+  TCCR1B |= (1 << CS10);
+
+  TIMSK1 |= (1 << OCIE1A);
+
+
+
+  interrupts();
+
+}
+
+
+
+void readEnc(long result[4]) {
+
+  noInterrupts();
+
+
+
+  for (byte i = 0; i < 4; i++) {
+
+    result[i] = enc[i];
+
+  }
+
+
+
+  interrupts();
+
+}
+
+
+
+void resetEncoders() {
+
+  noInterrupts();
+
+
+
+  for (byte i = 0; i < 4; i++) {
+
+    enc[i] = 0;
+
+  }
+
+
+
+  interrupts();
+
+}
+
+
+
+void motorRun(byte pwmPin, byte in1, byte in2, int speed) {
+
+  speed = constrain(speed, -255, 255);
+
+
+
+  if (speed > 0) {
+
+    digitalWrite(in1, HIGH);
+
+    digitalWrite(in2, LOW);
+
+    analogWrite(pwmPin, speed);
+
+  }
+
+  else if (speed < 0) {
+
+    digitalWrite(in1, LOW);
+
+    digitalWrite(in2, HIGH);
+
+    analogWrite(pwmPin, -speed);
+
+  }
+
+  else {
+
+    analogWrite(pwmPin, 0);
+
+    digitalWrite(in1, LOW);
+
+    digitalWrite(in2, LOW);
+
+  }
+
+}
+
+
+
+void stopMotors() {
+
+  motorRun(M1_PWM, M1_IN1, M1_IN2, 0);
+
+  motorRun(M2_PWM, M2_IN1, M2_IN2, 0);
+
+  motorRun(M3_PWM, M3_IN1, M3_IN2, 0);
+
+  motorRun(M4_PWM, M4_IN1, M4_IN2, 0);
+
+}
+
+
+
+void runMovement(MoveType type, int spd) {
+
+  switch (type) {
+
+    case DIAGONAL_FRONT_RIGHT:
+
+      motorRun(M1_PWM, M1_IN1, M1_IN2, spd);
+
+      motorRun(M2_PWM, M2_IN1, M2_IN2, 0);
+
+      motorRun(M3_PWM, M3_IN1, M3_IN2, 0);
+
+      motorRun(M4_PWM, M4_IN1, M4_IN2, spd);
+
+      break;
+
+
+
+    case ROTATE_RIGHT:
+
+      motorRun(M1_PWM, M1_IN1, M1_IN2, -spd);
+
+      motorRun(M2_PWM, M2_IN1, M2_IN2, -spd);
+
+      motorRun(M3_PWM, M3_IN1, M3_IN2, spd);
+
+      motorRun(M4_PWM, M4_IN1, M4_IN2, spd);
+
+      break;
+
+
+
+    case STRAFE_RIGHT:
+
+      motorRun(M1_PWM, M1_IN1, M1_IN2, spd);
+
+      motorRun(M2_PWM, M2_IN1, M2_IN2, -spd);
+
+      motorRun(M3_PWM, M3_IN1, M3_IN2, -spd);
+
+      motorRun(M4_PWM, M4_IN1, M4_IN2, spd);
+
+      break;
+
+
+
+    case BACKWARD:
+
+      motorRun(M1_PWM, M1_IN1, M1_IN2, -spd);
+
+      motorRun(M2_PWM, M2_IN1, M2_IN2, -spd);
+
+      motorRun(M3_PWM, M3_IN1, M3_IN2, -spd);
+
+      motorRun(M4_PWM, M4_IN1, M4_IN2, -spd);
+
+      break;
+
+
+
+    case STRAFE_LEFT:
+
+      motorRun(M1_PWM, M1_IN1, M1_IN2, -spd);
+
+      motorRun(M2_PWM, M2_IN1, M2_IN2, spd);
+
+      motorRun(M3_PWM, M3_IN1, M3_IN2, spd);
+
+      motorRun(M4_PWM, M4_IN1, M4_IN2, -spd);
+
+      break;
+
+
+
+    case FORWARD:
+
+      motorRun(M1_PWM, M1_IN1, M1_IN2, spd);
+
+      motorRun(M2_PWM, M2_IN1, M2_IN2, spd);
+
+      motorRun(M3_PWM, M3_IN1, M3_IN2, spd);
+
+      motorRun(M4_PWM, M4_IN1, M4_IN2, spd);
+
+      break;
+
+  }
+
+}
+
+
+
+bool encoderMove(float mm, float factor, MoveType type, float slowDistance) {
+
+  resetEncoders();
+
+
+
+  float targetCounts = mm * factor * COUNTS_PER_MM;
+
+
+
+  unsigned long startTime = millis();
+
+  unsigned long timeout = 3000UL + (unsigned long)(mm * 12.0);
+
+
+
+  long current[4] = {0, 0, 0, 0};
+
+  float progress = 0;
+
+
+
+  while (progress < targetCounts) {
+
+    if (abortRequested()) {
+
+      return false;
+
+    }
+
+
+
+    readEnc(current);
+
+
+
+    if (type == DIAGONAL_FRONT_RIGHT) {
+
+      progress = (abs(current[0]) + abs(current[3])) / 2.0;
+
+    }
+
+    else {
+
+      progress = (
+
+        abs(current[0]) +
+
+        abs(current[1]) +
+
+        abs(current[2]) +
+
+        abs(current[3])
+
+      ) / 4.0;
+
+    }
+
+
+
+    float remaining = targetCounts - progress;
+
+    int currentSpeed = SPEED;
+
+
+
+    if (remaining <= slowDistance * COUNTS_PER_MM) {
+
+      currentSpeed = SLOW_SPEED;
+
+    }
+
+
+
+    runMovement(type, currentSpeed);
+
+
+
+    if (millis() - startTime > timeout) {
+
+      stopMotors();
+
+      Serial.println(F("ERROR: MOVEMENT TIMEOUT"));
+
+      return false;
+
+    }
+
+  }
+
+
+
+  stopMotors();
+
+  delay(200);
+
+
+
+  return true;
+
+}
+
+
+
+const char *moveName(MoveType type) {
+
+  switch (type) {
+
+    case DIAGONAL_FRONT_RIGHT: return "DIAGONAL FRONT RIGHT";
+
+    case ROTATE_RIGHT:         return "ROTATE RIGHT (wheel mm)";
+
+    case STRAFE_RIGHT:         return "STRAFE RIGHT";
+
+    case STRAFE_LEFT:          return "STRAFE LEFT";
+
+    case FORWARD:              return "FORWARD";
+
+    case BACKWARD:             return "BACKWARD";
+
+  }
+
+  return "";
+
+}
+
+
+
+float moveFactor(MoveType type) {
+
+  switch (type) {
+
+    case DIAGONAL_FRONT_RIGHT: return DIAGONAL_FACTOR;
+
+    case STRAFE_RIGHT:         return STRAFE_FACTOR;
+
+    case STRAFE_LEFT:          return STRAFE_FACTOR;
+
+    case FORWARD:              return FORWARD_FACTOR;
+
+    case BACKWARD:             return BACKWARD_FACTOR;
+
+    default:                   return 1.0;
+
+  }
+
+}
+
+
+
+// Small slow move used by the camera alignment (not a numbered step)
+
+bool smallMove(MoveType type, float mm) {
+
+  Serial.print(F("   move: "));
+
+  Serial.print(moveName(type));
+
+  Serial.print(F(" "));
+
+  Serial.println((int)(mm + 0.5));
+
+
+
+  if (!encoderMove(mm, moveFactor(type), type, mm)) {   // whole move at slow speed
+
+    stopMotors();
+
+    return false;
+
+  }
+
+
+
+  delay(150);
+
+  return true;
+
+}
+
+
+
+// One drive step. The right factor is chosen from the move type.
+
+// For ROTATE_RIGHT give the wheel distance (TURN_90_WHEEL_MM).
+
+bool drive(MoveType type, float mm, float slowDistance) {
+
+  const char *name = moveName(type);
+
+  float factor = moveFactor(type);
+
+
+
+  stepCounter++;
+
+
+
+  Serial.print(F("STEP "));
+
+  Serial.print(stepCounter);
+
+  Serial.print(F(": "));
+
+  Serial.print(name);
+
+  Serial.print(F(" "));
+
+  Serial.println((int)mm);
+
+
+
+  if (!encoderMove(mm, factor, type, slowDistance)) {
+
+    stopMotors();
+
+    Serial.print(F("STOPPED: STEP "));
+
+    Serial.print(stepCounter);
+
+    Serial.println(F(" FAILED"));
+
+    return false;
+
+  }
+
+
+
+  delay(300);
+
+  return true;
+
+}
+
+
+
+// ======================================================
+
+// GROVE VISION AI V2 - LIGHTWEIGHT I2C DRIVER (AVR safe)
+
+// Sends AT+INVOKE over I2C and parses the "boxes" JSON.
+
+// ======================================================
+
+
+
+#define GV2_ADDR        0x62
+
+#define GV2_FEATURE     0x10
+
+#define GV2_CMD_READ    0x01
+
+#define GV2_CMD_WRITE   0x02
+
+#define GV2_CMD_AVAIL   0x03
+
+#define GV2_CHUNK       24     // AVR Wire buffer = 32 bytes
+
+#define GV2_LINE_MAX    600
+
+#define GV2_TIMEOUT_MS  1500
+
+#define MAX_BOXES       10
+
+
+
+struct Box
+
+{
+
+  int x, y, w, h, score, target;
+
+};
+
+
+
+Box boxes[MAX_BOXES];
+
+int boxCount = 0;
+
+
+
+char gvLine[GV2_LINE_MAX];
+
+int  gvLen = 0;
+
+
+
+bool gv2Present()
+
+{
+
+  Wire.beginTransmission(GV2_ADDR);
+
+  return Wire.endTransmission() == 0;
+
+}
+
+
+
+void gv2Write(const char *data, uint16_t len)
+
+{
+
+  uint16_t sent = 0;
+
+  while (sent < len)
+
+  {
+
+    uint16_t n = len - sent;
+
+    if (n > GV2_CHUNK) n = GV2_CHUNK;
+
+
+
+    Wire.beginTransmission(GV2_ADDR);
+
+    Wire.write(GV2_FEATURE);
+
+    Wire.write(GV2_CMD_WRITE);
+
+    Wire.write((uint8_t)(n >> 8));
+
+    Wire.write((uint8_t)(n & 0xFF));
+
+    Wire.write((const uint8_t *)data + sent, n);
+
+    Wire.write((uint8_t)0);   // checksum (unused)
+
+    Wire.write((uint8_t)0);
+
+    Wire.endTransmission();
+
+
+
+    sent += n;
+
+  }
+
+}
+
+
+
+uint16_t gv2Available()
+
+{
+
+  Wire.beginTransmission(GV2_ADDR);
+
+  Wire.write(GV2_FEATURE);
+
+  Wire.write(GV2_CMD_AVAIL);
+
+  Wire.write((uint8_t)0);
+
+  Wire.write((uint8_t)0);
+
+  Wire.write((uint8_t)0);
+
+  Wire.write((uint8_t)0);
+
+  if (Wire.endTransmission() != 0)
+
+    return 0;
+
+
+
+  delay(2);
+
+  if (Wire.requestFrom((uint8_t)GV2_ADDR, (uint8_t)2) != 2)
+
+    return 0;
+
+
+
+  uint16_t hi = Wire.read();
+
+  uint16_t lo = Wire.read();
+
+  return (hi << 8) | lo;
+
+}
+
+
+
+uint8_t gv2Read(uint8_t *buf, uint8_t len)   // len <= 32
+
+{
+
+  Wire.beginTransmission(GV2_ADDR);
+
+  Wire.write(GV2_FEATURE);
+
+  Wire.write(GV2_CMD_READ);
+
+  Wire.write((uint8_t)0);
+
+  Wire.write(len);
+
+  Wire.write((uint8_t)0);
+
+  Wire.write((uint8_t)0);
+
+  if (Wire.endTransmission() != 0)
+
+    return 0;
+
+
+
+  delay(2);
+
+  uint8_t got = Wire.requestFrom((uint8_t)GV2_ADDR, len);
+
+  for (uint8_t i = 0; i < got; i++)
+
+    buf[i] = Wire.read();
+
+  return got;
+
+}
+
+
+
+// Throw away any old data waiting in the Grove
+
+void gv2Flush()
+
+{
+
+  uint8_t tmp[32];
+
+  unsigned long t0 = millis();
+
+  uint16_t n;
+
+  while ((n = gv2Available()) > 0 && millis() - t0 < 300)
+
+    gv2Read(tmp, n > 32 ? 32 : (uint8_t)n);
+
+}
+
+
+
+// Parse  "boxes": [[x,y,w,h,score,target], ...]
+
+void gv2ParseBoxes(const char *p)
+
+{
+
+  boxCount = 0;
+
+  p = strchr(p, '[');
+
+  if (!p) return;
+
+  p++;
+
+
+
+  while (*p && boxCount < MAX_BOXES)
+
+  {
+
+    while (*p == ' ' || *p == ',') p++;
+
+    if (*p != '[') break;
+
+    p++;
+
+
+
+    double v[6];
+
+    int k = 0;
+
+    while (k < 6)
+
+    {
+
+      while (*p == ' ' || *p == ',') p++;
+
+      if (*p == ']' || *p == 0) break;
+
+      char *e;
+
+      v[k] = strtod(p, &e);
+
+      if (e == p) return;
+
+      p = e;
+
+      k++;
+
+    }
+
+
+
+    while (*p && *p != ']') p++;
+
+    if (*p == ']') p++;
+
+
+
+    if (k == 6)
+
+    {
+
+      Box &b = boxes[boxCount++];
+
+      b.x = (int)v[0];
+
+      b.y = (int)v[1];
+
+      b.w = (int)v[2];
+
+      b.h = (int)v[3];
+
+      // score may come as 0-100 or 0.0-1.0
+
+      b.score = (v[4] <= 1.0) ? (int)(v[4] * 100.0 + 0.5) : (int)v[4];
+
+      b.target = (int)v[5];
+
+    }
+
+  }
+
+}
+
+
+
+// 1 = boxes received, 0 = keep waiting, -1 = error reply
+
+int gv2HandleLine()
+
+{
+
+  if (!strstr(gvLine, "INVOKE"))
+
+    return 0;
+
+
+
+  const char *c = strstr(gvLine, "\"code\"");
+
+  if (c)
+
+  {
+
+    c = strchr(c, ':');
+
+    if (c && atoi(c + 1) != 0)
+
+      return -1;
+
+  }
+
+
+
+  const char *b = strstr(gvLine, "\"boxes\"");
+
+  if (!b)
+
+    return 0;   // first ACK reply, result comes next
+
+
+
+  gv2ParseBoxes(b);
+
+  return 1;
+
+}
+
+
+
+// Run one inference. Returns 0 on success (like SSCMA lib).
+
+int gv2Invoke()
+
+{
+
+  gv2Flush();
+
+
+
+  const char cmd[] = "AT+INVOKE=1,0,1\r\n";   // 1 frame, results only
+
+  gv2Write(cmd, strlen(cmd));
+
+
+
+  bool inLine = false;
+
+  gvLen = 0;
+
+  uint8_t buf[32];
+
+  unsigned long t0 = millis();
+
+
+
+  while (millis() - t0 < GV2_TIMEOUT_MS)
+
+  {
+
+    uint16_t n = gv2Available();
+
+    if (n == 0)
+
+    {
+
+      delay(5);
+
+      continue;
+
+    }
+
+
+
+    while (n > 0)
+
+    {
+
+      uint8_t want = n > 32 ? 32 : (uint8_t)n;
+
+      uint8_t got = gv2Read(buf, want);
+
+      if (got == 0) break;
+
+      n = (got >= n) ? 0 : n - got;
+
+
+
+      for (uint8_t i = 0; i < got; i++)
+
+      {
+
+        char ch = (char)buf[i];
+
+
+
+        if (!inLine)
+
+        {
+
+          if (ch == '{')
+
+          {
+
+            inLine = true;
+
+            gvLen = 0;
+
+            gvLine[gvLen++] = ch;
+
+          }
+
+          continue;
+
+        }
+
+
+
+        if (ch == '\n')
+
+        {
+
+          gvLine[gvLen] = 0;
+
+          inLine = false;
+
+          int r = gv2HandleLine();
+
+          if (r == 1)  return 0;
+
+          if (r == -1) return -1;
+
+          continue;
+
+        }
+
+
+
+        if (gvLen < GV2_LINE_MAX - 1)
+
+          gvLine[gvLen++] = ch;
+
+        else
+
+          inLine = false;   // too long, drop
+
+      }
+
+    }
+
+  }
+
+
+
+  return -2;   // timeout
+
+}
+
+
+
+bool visionOk = false;
+
+
+
+// ======================================================
+
+// ARM (blocking smooth moves, same style as the drive code)
+
+// ======================================================
+
+
+
+float armBase, armBottom, armTop;
+
+bool armDriverOk = false;
+
+
+
+// ======================================================
+
+// SAVED SETTINGS (EEPROM)
+
+// ======================================================
+
+
+
+void settingsDefaults() {
+
+  cfg.magic = SETTINGS_MAGIC;
+
+  cfg.codePickBottom = PICK_BOTTOM;
+
+  cfg.pickBottom = PICK_BOTTOM;
+
+  cfg.targetX = 0;
+
+  cfg.targetY = 0;
+
+  cfg.sx = cfg.sy = cfg.fx = cfg.fy = 0;
+
+  cfg.targetSet = 0;
+
+  cfg.calibrated = 0;
+
+}
+
+
+
+void settingsSave() {
+
+  cfg.magic = SETTINGS_MAGIC;
+
+  cfg.codePickBottom = PICK_BOTTOM;
+
+  EEPROM.put(0, cfg);
+
+}
+
+
+
+void settingsLoad() {
+
+  EEPROM.get(0, cfg);
+
+
+
+  if (cfg.magic != SETTINGS_MAGIC) {
+
+    settingsDefaults();
+
+    return;
+
+  }
+
+
+
+  // PICK_BOTTOM was edited in the code: the code wins
+
+  if (cfg.codePickBottom != PICK_BOTTOM) {
+
+    cfg.pickBottom = PICK_BOTTOM;
+
+    cfg.codePickBottom = PICK_BOTTOM;
+
+  }
+
+
+
+  cfg.pickBottom = constrain(cfg.pickBottom, BOTTOM_MIN, BOTTOM_MAX);
+
+}
+
+
+
+bool alignReady() {
+
+  return ALIGN_ENABLE && cfg.targetSet && cfg.calibrated;
+
+}
+
+
+
+void showSettings() {
+
+  Serial.println(F("----- saved settings -----"));
+
+  Serial.print(F("Pick height (PICK_BOTTOM) = "));
+
+  Serial.println(cfg.pickBottom);
+
+
+
+  Serial.print(F("Target (T): "));
+
+  if (cfg.targetSet) {
+
+    Serial.print(F("x="));
+
+    Serial.print(cfg.targetX);
+
+    Serial.print(F(" y="));
+
+    Serial.println(cfg.targetY);
+
+  } else {
+
+    Serial.println(F("NOT DONE"));
+
+  }
+
+
+
+  Serial.print(F("Camera calibration (C): "));
+
+  if (cfg.calibrated) {
+
+    Serial.print(F("strafe "));
+
+    Serial.print(cfg.sx);
+
+    Serial.print(F(","));
+
+    Serial.print(cfg.sy);
+
+    Serial.print(F("  forward "));
+
+    Serial.print(cfg.fx);
+
+    Serial.print(F(","));
+
+    Serial.print(cfg.fy);
+
+    Serial.println(F("  px/mm"));
+
+  } else {
+
+    Serial.println(F("NOT DONE"));
+
+  }
+
+
+
+  Serial.println(alignReady() ? F("Pick mode: ALIGN to the sample, then pick")
+
+                              : F("Pick mode: BLIND (fixed position). Do T and C to align."));
+
+  Serial.println(F("--------------------------"));
+
+}
+
+
+
+void armApply() {
+
+  pwm.setPWM(BASE_SERVO,   0, constrain((int)armBase,   BASE_MIN,   BASE_MAX));
+
+  pwm.setPWM(BOTTOM_SERVO, 0, constrain((int)armBottom, BOTTOM_MIN, BOTTOM_MAX));
+
+  pwm.setPWM(TOP_SERVO,    0, constrain((int)armTop,    TOP_MIN,    TOP_MAX));
+
+}
+
+
+
+// Returns false if X was sent during the move
+
+bool armMoveTo(int b, int bo, int t, unsigned long durationMs) {
+
+  float b0 = armBase, bo0 = armBottom, t0 = armTop;
+
+
+
+  float b1  = constrain(b,  BASE_MIN,   BASE_MAX);
+
+  float bo1 = constrain(bo, BOTTOM_MIN, BOTTOM_MAX);
+
+  float t1  = constrain(t,  TOP_MIN,    TOP_MAX);
+
+
+
+  // Already there: nothing to do
+
+  if ((int)b0 == (int)b1 && (int)bo0 == (int)bo1 && (int)t0 == (int)t1) {
+
+    return true;
+
+  }
+
+
+
+  unsigned long start = millis();
+
+
+
+  while (true) {
+
+    if (abortRequested()) {
+
+      return false;
+
+    }
+
+
+
+    float k = (durationMs == 0) ? 1.0 : (float)(millis() - start) / (float)durationMs;
+
+    if (k > 1.0) k = 1.0;
+
+
+
+    float s = k * k * (3.0 - 2.0 * k);   // smoothstep
+
+
+
+    armBase   = b0  + (b1  - b0)  * s;
+
+    armBottom = bo0 + (bo1 - bo0) * s;
+
+    armTop    = t0  + (t1  - t0)  * s;
+
+    armApply();
+
+
+
+    if (k >= 1.0) break;
+
+    delay(10);
+
+  }
+
+
+
+  armBase = b1;
+
+  armBottom = bo1;
+
+  armTop = t1;
+
+  armApply();
+
+  return true;
+
+}
+
+
+
+bool armToInitial() { return armMoveTo(INITIAL_BASE, INITIAL_BOTTOM, INITIAL_TOP, ARM_DOWN_MS); }
+
+bool armToScan()    { return armMoveTo(SCAN_BASE, SCAN_BOTTOM, SCAN_TOP, ARM_MOVE_MS); }
+
+bool armToPick()    { return armMoveTo(PICK_BASE, cfg.pickBottom, PICK_TOP, ARM_DOWN_MS); }
+
+bool armToPlace()   { return armMoveTo(PICK_BASE, cfg.pickBottom + PLACE_ABOVE_PICK, PICK_TOP, ARM_DOWN_MS); }
+
+
+
+void setSuction(bool on) {
+
+  digitalWrite(SUCTION_PIN, on ? SUCTION_ON : SUCTION_OFF);
+
+  suctionActive = on;
+
+  Serial.println(on ? F("Suction ON") : F("Suction OFF"));
+
+}
+
+
+
+// Pause that can still be stopped with X
+
+bool waitMs(unsigned long ms) {
+
+  unsigned long start = millis();
+
+  while (millis() - start < ms) {
+
+    if (abortRequested()) return false;
+
+    delay(5);
+
+  }
+
+  return true;
+
+}
+
+
+
+// ======================================================
+
+// VISION: look for the sample from the scan pose
+
+// ======================================================
+
+
+
+// On success x, y = sample position in the picture (average of the frames)
+
+bool lookForSample(int &x, int &y) {
+
+  if (!visionOk) {
+
+    visionOk = gv2Present();
+
+  }
+
+
+
+  if (!visionOk) {
+
+    Serial.println(F("Camera: Grove NOT FOUND on I2C (0x62)"));
+
+    return false;
+
+  }
+
+
+
+  int hits = 0;
+
+  long sumX = 0, sumY = 0;
+
+  unsigned long start = millis();
+
+
+
+  while (millis() - start < SCAN_TIMEOUT_MS) {
+
+    if (abortRequested()) return false;
+
+
+
+    if (gv2Invoke() != 0) {
+
+      hits = 0; sumX = 0; sumY = 0;
+
+      continue;
+
+    }
+
+
+
+    int best = -1;
+
+    for (int i = 0; i < boxCount; i++) {
+
+      if (boxes[i].target == SAMPLE_TARGET_ID && boxes[i].score >= MIN_SCORE) {
+
+        if (best < 0 || boxes[i].score > boxes[best].score) best = i;
+
+      }
+
+    }
+
+
+
+    if (best < 0) {
+
+      hits = 0; sumX = 0; sumY = 0;
+
+      continue;
+
+    }
+
+
+
+    hits++;
+
+    sumX += boxes[best].x;
+
+    sumY += boxes[best].y;
+
+
+
+    if (hits >= CONFIRM_FRAMES) {
+
+      x = (int)(sumX / hits);
+
+      y = (int)(sumY / hits);
+
+
+
+      Serial.print(F("Camera: SAMPLE seen  score="));
+
+      Serial.print(boxes[best].score);
+
+      Serial.print(F("  x="));
+
+      Serial.print(x);
+
+      Serial.print(F("  y="));
+
+      Serial.println(y);
+
+      return true;
+
+    }
+
+  }
+
+
+
+  Serial.println(F("Camera: sample NOT seen"));
+
+  return false;
+
+}
+
+
+
+// ======================================================
+
+// CAMERA ALIGNMENT
+
+// The robot strafes / drives a little so that the sample sits
+
+// at the taught target point, which is right under the nozzle.
+
+// ======================================================
+
+
+
+// T: the sample is under the nozzle now. Remember where the camera sees it.
+
+void teachTarget() {
+
+  int x, y;
+
+
+
+  if (!armToScan()) return;
+
+  if (!waitMs(400)) return;
+
+
+
+  if (!lookForSample(x, y)) {
+
+    Serial.println(F("TEACH failed: the camera must see the sample."));
+
+    return;
+
+  }
+
+
+
+  cfg.targetX = x;
+
+  cfg.targetY = y;
+
+  cfg.targetSet = 1;
+
+  settingsSave();
+
+
+
+  Serial.print(F("TARGET saved: x="));
+
+  Serial.print(x);
+
+  Serial.print(F(" y="));
+
+  Serial.println(y);
+
+}
+
+
+
+// C: learn how the picture moves when the robot moves. WHEELS MOVE.
+
+void calibrateCamera() {
+
+  int x0, y0, x1, y1, x2, y2;
+
+
+
+  Serial.println(F("CALIBRATE: robot will move right and forward, then come back."));
+
+
+
+  if (!armToScan()) return;
+
+  if (!waitMs(400)) return;
+
+  if (!lookForSample(x0, y0)) { Serial.println(F("CALIBRATE failed: sample not seen.")); return; }
+
+
+
+  if (!smallMove(STRAFE_RIGHT, CAL_MOVE_MM)) return;
+
+  if (!waitMs(400)) return;
+
+  bool okS = lookForSample(x1, y1);
+
+  if (!smallMove(STRAFE_LEFT, CAL_MOVE_MM)) return;
+
+
+
+  if (!smallMove(FORWARD, CAL_MOVE_MM)) return;
+
+  if (!waitMs(400)) return;
+
+  bool okF = lookForSample(x2, y2);
+
+  if (!smallMove(BACKWARD, CAL_MOVE_MM)) return;
+
+
+
+  if (!okS || !okF) {
+
+    Serial.println(F("CALIBRATE failed: sample left the picture. Put it nearer the middle and try again."));
+
+    return;
+
+  }
+
+
+
+  float sx = (float)(x1 - x0) / CAL_MOVE_MM;
+
+  float sy = (float)(y1 - y0) / CAL_MOVE_MM;
+
+  float fx = (float)(x2 - x0) / CAL_MOVE_MM;
+
+  float fy = (float)(y2 - y0) / CAL_MOVE_MM;
+
+  float det = sx * fy - fx * sy;
+
+
+
+  if (det < 0.02 && det > -0.02) {
+
+    Serial.println(F("CALIBRATE failed: the picture did not move enough. Did the wheels move?"));
+
+    return;
+
+  }
+
+
+
+  cfg.sx = sx; cfg.sy = sy;
+
+  cfg.fx = fx; cfg.fy = fy;
+
+  cfg.calibrated = 1;
+
+  settingsSave();
+
+
+
+  Serial.println(F("CALIBRATION saved."));
+
+  showSettings();
+
+}
+
+
+
+// Moves the robot until the sample is at the target point.
+
+// offS / offF = how far it moved (strafe right +, forward +), in mm.
+
+// Returns false only if the robot was stopped (X) or a move failed.
+
+bool alignToSample(int x, int y, float &offS, float &offF) {
+
+  float det = cfg.sx * cfg.fy - cfg.fx * cfg.sy;
+
+
+
+  for (int attempt = 0; attempt < ALIGN_MAX_TRIES; attempt++) {
+
+    float dx = cfg.targetX - x;
+
+    float dy = cfg.targetY - y;
+
+
+
+    if (abs(dx) <= ALIGN_TOL_PX && abs(dy) <= ALIGN_TOL_PX) {
+
+      Serial.println(F("ALIGNED: sample is under the nozzle"));
+
+      return true;
+
+    }
+
+
+
+    // How far to strafe (s) and drive forward (f) to shift the picture by dx, dy
+
+    float s = (dx * cfg.fy - cfg.fx * dy) / det;
+
+    float f = (cfg.sx * dy - dx * cfg.sy) / det;
+
+
+
+    // Never go further than ALIGN_MAX_MM from the stop point
+
+    s = constrain(offS + s, -ALIGN_MAX_MM, ALIGN_MAX_MM) - offS;
+
+    f = constrain(offF + f, -ALIGN_MAX_MM, ALIGN_MAX_MM) - offF;
+
+
+
+    bool moved = false;
+
+
+
+    if (abs(s) >= ALIGN_MIN_MM) {
+
+      if (!smallMove(s > 0 ? STRAFE_RIGHT : STRAFE_LEFT, abs(s))) return false;
+
+      offS += s;
+
+      moved = true;
+
+    }
+
+
+
+    if (abs(f) >= ALIGN_MIN_MM) {
+
+      if (!smallMove(f > 0 ? FORWARD : BACKWARD, abs(f))) return false;
+
+      offF += f;
+
+      moved = true;
+
+    }
+
+
+
+    if (!moved) {
+
+      Serial.println(F("ALIGN: as close as the robot can get"));
+
+      return true;
+
+    }
+
+
+
+    if (!waitMs(300)) return false;
+
+
+
+    if (!lookForSample(x, y)) {
+
+      if (missionAborted) return false;
+
+      Serial.println(F("ALIGN: sample lost after moving, picking here"));
+
+      return true;
+
+    }
+
+  }
+
+
+
+  Serial.println(F("ALIGN: tries used up, picking here"));
+
+  return true;
+
+}
+
+
+
+// Drive back to the stop point, so the next mission moves stay correct
+
+bool undoAlign(float offS, float offF) {
+
+  if (abs(offF) >= ALIGN_MIN_MM) {
+
+    if (!smallMove(offF > 0 ? BACKWARD : FORWARD, abs(offF))) return false;
+
+  }
+
+  if (abs(offS) >= ALIGN_MIN_MM) {
+
+    if (!smallMove(offS > 0 ? STRAFE_LEFT : STRAFE_RIGHT, abs(offS))) return false;
+
+  }
+
+  return true;
+
+}
+
+
+
+// A: align once and stay there (then use D to see where the nozzle lands)
+
+void alignTest() {
+
+  int x, y;
+
+  float offS = 0, offF = 0;
+
+
+
+  if (!alignReady()) {
+
+    Serial.println(F("Align not ready. Do T (teach) and C (calibrate) first."));
+
+    return;
+
+  }
+
+
+
+  if (!armToScan()) return;
+
+  if (!waitMs(400)) return;
+
+  if (!lookForSample(x, y)) return;
+
+
+
+  alignToSample(x, y, offS, offF);
+
+
+
+  Serial.print(F("Robot moved: strafe right "));
+
+  Serial.print(offS);
+
+  Serial.print(F(" mm, forward "));
+
+  Serial.print(offF);
+
+  Serial.println(F(" mm. Send D to see where the nozzle lands."));
+
+}
+
+
+
+// ======================================================
+
+// MISSION ACTIONS
+
+// ======================================================
+
+
+
+// Scan with the camera, move onto the sample, pick, move back.
+
+// Ends in the carry (scan) pose.
+
+bool pickSample(byte n) {
+
+  Serial.println();
+
+  Serial.print(F(">>> SAMPLE "));
+
+  Serial.print(n);
+
+  Serial.println(F(": SCAN + PICK"));
+
+
+
+  if (!armToScan()) return false;
+
+  if (!waitMs(300)) return false;       // let the camera settle
+
+
+
+  int x = 0, y = 0;
+
+  float offS = 0, offF = 0;
+
+
+
+  bool seen = lookForSample(x, y);
+
+  if (missionAborted) return false;
+
+
+
+  if (seen && alignReady()) {
+
+    if (!alignToSample(x, y, offS, offF)) return false;
+
+  }
+
+
+
+  if (!seen) {
+
+    if (PICK_IF_NOT_SEEN) {
+
+      Serial.println(F("Picking anyway (PICK_IF_NOT_SEEN = 1)"));
+
+    } else {
+
+      Serial.println(F("Pick SKIPPED (PICK_IF_NOT_SEEN = 0)"));
+
+      return true;
+
+    }
+
+  }
+
+
+
+  if (!armToPick()) return false;
+
+  setSuction(true);
+
+  if (!waitMs(PICK_DWELL_MS)) return false;
+
+  if (!armToScan()) return false;       // lift and carry
+
+
+
+  if (!undoAlign(offS, offF)) return false;   // back to the stop point
+
+
+
+  Serial.print(F("PICKED sample "));
+
+  Serial.println(n);
+
+  return true;
+
+}
+
+
+
+// Put the sample down. Ends in the scan pose.
+
+bool placeSample(byte n) {
+
+  Serial.println();
+
+  Serial.print(F(">>> SAMPLE "));
+
+  Serial.print(n);
+
+  Serial.println(F(": PLACE"));
+
+
+
+  if (!armToPlace()) return false;
+
+  setSuction(false);
+
+  if (!waitMs(PLACE_DWELL_MS)) return false;
+
+  if (!armToScan()) return false;
+
+
+
+  Serial.print(F("PLACED sample "));
+
+  Serial.println(n);
+
+  return true;
+
+}
+
+
+
+bool openSlab() {
+
+  Serial.println();
+
+  Serial.println(F(">>> SLAB SERVO"));
+
+
+
+#if USE_SLAB_SERVO
+
+  pwm.setPWM(SLAB_SERVO, 0, SLAB_OPEN);
+
+  Serial.println(F("Slab servo OPEN"));
+
+\#else
+
+  Serial.println(F("Slab servo NOT CONFIGURED (USE_SLAB_SERVO = 0). Pausing only."));
+
+#endif
+
+
+
+  return waitMs(SLAB_WAIT_MS);
+
+}
+
+
+
+// ======================================================
+
+// THE MISSION
+
+// ======================================================
+
+
+
+bool runMission() {
+
+  stepCounter = 0;
+
+  missionAborted = false;
+
+
+
+  Serial.println();
+
+  Serial.println(F("MISSION 1 START"));
+
+
+
+  setSuction(false);
+
+  if (!armToInitial()) return false;
+
+
+
+  // ---- Start zone -> quarantine zone ----
+
+  if (!drive(DIAGONAL_FRONT_RIGHT, 900, 40)) return false;
+
+  if (!drive(ROTATE_RIGHT, TURN_90_WHEEL_MM, 40)) return false;
+
+  if (!drive(STRAFE_RIGHT, 600, 40)) return false;
+
+  if (!drive(BACKWARD, 20, 10)) return false;
+
+
+
+  // ---- Sample 1 ----
+
+  if (!pickSample(1)) return false;
+
+  if (!drive(STRAFE_LEFT, 240, 10)) return false;
+
+  if (!drive(FORWARD, 80, 10)) return false;
+
+  if (!placeSample(1)) return false;
+
+  if (!drive(BACKWARD, 100, 10)) return false;
+
+  if (!drive(STRAFE_RIGHT, 240, 10)) return false;
+
+
+
+  // ---- Sample 2 ----
+
+  if (!pickSample(2)) return false;
+
+  if (!drive(STRAFE_LEFT, 350, 10)) return false;
+
+  if (!drive(FORWARD, 100, 10)) return false;
+
+  if (!placeSample(2)) return false;
+
+  if (!drive(BACKWARD, 100, 10)) return false;
+
+  if (!drive(STRAFE_RIGHT, 350, 10)) return false;
+
+
+
+  // ---- Sample 3 ----
+
+  if (!pickSample(3)) return false;
+
+  if (!drive(STRAFE_LEFT, 600, 10)) return false;
+
+  if (!drive(FORWARD, 100, 10)) return false;
+
+  if (!placeSample(3)) return false;
+
+  if (!drive(BACKWARD, 100, 10)) return false;
+
+  if (!drive(STRAFE_RIGHT, 600, 10)) return false;
+
+
+
+  // ---- Slab ----
+
+  if (!drive(FORWARD, 35, 8)) return false;
+
+  if (!openSlab()) return false;
+
+  if (!drive(BACKWARD, 80, 10)) return false;
+
+
+
+  stopMotors();
+
+
+
+  Serial.println();
+
+  Serial.println(F("MISSION 1 COMPLETE - ALL STEPS FINISHED"));
+
+  return true;
+
+}
+
+
+
+void startMission() {
+
+  unsigned long t0 = millis();
+
+  bool ok = runMission();
+
+
+
+  stopMotors();
+
+
+
+  if (!ok) {
+
+    Serial.println();
+
+    if (missionAborted) Serial.println(F("!!! STOPPED BY X !!!"));
+
+    else                Serial.println(F("!!! MISSION STOPPED (step failed) !!!"));
+
+    Serial.println(F("Motors off. Arm holds. S = suction, I = arm to INITIAL, P = run again."));
+
+  }
+
+
+
+  Serial.print(F("Time: "));
+
+  Serial.print((millis() - t0) / 1000);
+
+  Serial.println(F(" s"));
+
+
+
+  missionAborted = false;
+
+}
+
+
+
+// ======================================================
+
+// SERIAL TESTS (only while waiting, wheels never move)
+
+// ======================================================
+
+
+
+void printHelp() {
+
+  Serial.println(F("P = START mission      X = STOP (any time)"));
+
+  Serial.println(F("K = scan + pick test   L = place test"));
+
+  Serial.println(F("H = scan pose          I = INITIAL"));
+
+  Serial.println(F("D = arm to pick height   + / - = pick height 5 lower / higher"));
+
+  Serial.println(F("W = show settings      S = suction   B = slab servo test"));
+
+  Serial.println(F("T = teach target   C = calibrate camera (WHEELS MOVE)"));
+
+  Serial.println(F("A = align test (WHEELS MOVE)   Z = forget saved settings"));
+
+}
+
+
+
+void showPickHeight() {
+
+  Serial.print(F("PICK_BOTTOM = "));
+
+  Serial.print(cfg.pickBottom);
+
+  Serial.println(F("   (saved)"));
+
+}
+
+
+
+void changePickHeight(int delta) {
+
+  int wanted = cfg.pickBottom + delta;
+
+  cfg.pickBottom = constrain(wanted, BOTTOM_MIN, BOTTOM_MAX);
+
+
+
+  if (cfg.pickBottom != wanted) {
+
+    Serial.print(F("LIMIT: lower arm allowed "));
+
+    Serial.print(BOTTOM_MIN);
+
+    Serial.print(F(" - "));
+
+    Serial.println(BOTTOM_MAX);
+
+  }
+
+
+
+  settingsSave();
+
+  armMoveTo(PICK_BASE, cfg.pickBottom, PICK_TOP, 300);
+
+  showPickHeight();
+
+}
+
+
+
+void forgetSettings() {
+
+  settingsDefaults();
+
+  settingsSave();
+
+  Serial.println(F("Saved settings cleared."));
+
+  showSettings();
+
+}
+
+
+
+void slabTest() {
+
+#if USE_SLAB_SERVO
+
+  static bool open = false;
+
+  open = !open;
+
+  pwm.setPWM(SLAB_SERVO, 0, open ? SLAB_OPEN : SLAB_CLOSED);
+
+  Serial.println(open ? F("Slab servo OPEN") : F("Slab servo CLOSED"));
+
+\#else
+
+  Serial.println(F("Slab servo NOT CONFIGURED. Set SLAB_SERVO, SLAB_CLOSED, SLAB_OPEN, then USE_SLAB_SERVO 1."));
+
+#endif
+
+}
+
+
+
+void checkSerial() {
+
+  if (!Serial.available()) return;
+
+
+
+  char c = Serial.read();
+
+  if (c >= 'a' && c <= 'z') c -= 32;
+
+
+
+  switch (c) {
+
+    case 'P': startMission();          break;
+
+    case 'K': pickSample(0);           break;
+
+    case 'L': placeSample(0);          break;
+
+    case 'H': armToScan();             break;
+
+    case 'I': armToInitial();          break;
+
+    case 'D': armToPick(); showPickHeight(); break;
+
+    case '-': changePickHeight(-5);    break;   // smaller value = lower
+
+    case '+': changePickHeight(+5);    break;
+
+    case 'W': showSettings();          break;
+
+    case 'S': setSuction(!suctionActive); break;
+
+    case 'B': slabTest();              break;
+
+    case 'T': teachTarget();           break;
+
+    case 'C': calibrateCamera();       break;
+
+    case 'A': alignTest();             break;
+
+    case 'Z': forgetSettings();        break;
+
+    case '?': printHelp();             break;
+
+  }
+
+
+
+  missionAborted = false;   // an X sent while idle must not block the next run
+
+}
+
+
+
+bool lastButtonState = HIGH;
+
+
+
+void checkStartButton() {
+
+  bool state = digitalRead(START_BUTTON_PIN);
+
+  if (lastButtonState == HIGH && state == LOW) {
+
+    delay(30);                                  // debounce
+
+    if (digitalRead(START_BUTTON_PIN) == LOW) startMission();
+
+  }
+
+  lastButtonState = state;
+
+}
+
+
+
+// ======================================================
+
+// SETUP + LOOP
+
+// ======================================================
+
+
+
+void setup() {
+
+  Serial.begin(115200);
+
+
+
+  // Suction OFF immediately at power-up
+
+  digitalWrite(SUCTION_PIN, SUCTION_OFF);
+
+  pinMode(SUCTION_PIN, OUTPUT);
+
+
+
+  pinMode(START_BUTTON_PIN, INPUT_PULLUP);
+
+
+
+  pinMode(M1_PWM, OUTPUT); pinMode(M1_IN1, OUTPUT); pinMode(M1_IN2, OUTPUT);
+
+  pinMode(M2_PWM, OUTPUT); pinMode(M2_IN1, OUTPUT); pinMode(M2_IN2, OUTPUT);
+
+  pinMode(M3_PWM, OUTPUT); pinMode(M3_IN1, OUTPUT); pinMode(M3_IN2, OUTPUT);
+
+  pinMode(M4_PWM, OUTPUT); pinMode(M4_IN1, OUTPUT); pinMode(M4_IN2, OUTPUT);
+
+
+
+  stopMotors();
+
+  encodersBegin();
+
+
+
+  settingsLoad();
+
+
+
+  Serial.println();
+
+  Serial.println(F("================================"));
+
+  Serial.println(F("MISSION 1 - BOTICS ALPHA ST68"));
+
+  Serial.println(F("================================"));
+
+  printHelp();
+
+  Serial.println();
+
+
+
+  // ---- I2C health check (arm driver and camera share this bus) ----
+
+  // With nothing talking, both lines must be HIGH. A LOW line means
+
+  // some I2C device is unpowered or wired wrong and it blocks ALL
+
+  // devices on the bus, including the arm.
+
+  pinMode(I2C_SDA_PIN, INPUT);
+
+  pinMode(I2C_SCL_PIN, INPUT);
+
+  delay(10);
+
+  bool sdaHigh = digitalRead(I2C_SDA_PIN);
+
+  bool sclHigh = digitalRead(I2C_SCL_PIN);
+
+
+
+  Serial.print(F("I2C lines: SDA="));
+
+  Serial.print(sdaHigh ? F("HIGH") : F("LOW"));
+
+  Serial.print(F("  SCL="));
+
+  Serial.println(sclHigh ? F("HIGH") : F("LOW"));
+
+
+
+  if (!sdaHigh || !sclHigh) {
+
+    Serial.println(F("!!! I2C BUS IS STUCK LOW. Arm and camera cannot work."));
+
+    Serial.println(F("!!! Check: Grove powered? Level shifter LV = 3.3V? Loose SDA/SCL wire?"));
+
+  }
+
+
+
+  Wire.begin();
+
+  Wire.setWireTimeout(25000, true);   // never hang if I2C gets stuck
+
+
+
+  Wire.beginTransmission(PCA9685_ADDR);
+
+  armDriverOk = (Wire.endTransmission() == 0);
+
+
+
+  Serial.print(F("Arm driver PCA9685 (0x40)... "));
+
+  Serial.println(armDriverOk ? F("OK") : F("NOT FOUND"));
+
+
+
+  if (!armDriverOk) {
+
+    Serial.println(F("!!! THE ARM WILL NOT MOVE until the PCA9685 answers on I2C."));
+
+  }
+
+
+
+  pwm.begin();
+
+  pwm.setPWMFreq(50);
+
+  delay(100);
+
+
+
+#if USE_SLAB_SERVO
+
+  pwm.setPWM(SLAB_SERVO, 0, SLAB_CLOSED);
+
+#endif
+
+
+
+  // Arm is resting at IDLE: hold it there, then go to INITIAL
+
+  armBase = IDLE_BASE;
+
+  armBottom = IDLE_BOTTOM;
+
+  armTop = IDLE_TOP;
+
+  armApply();
+
+
+
+  // Grove needs a few seconds to boot, so retry
+
+  Serial.print(F("Connecting Grove Vision AI V2... "));
+
+  for (int i = 0; i < 10 && !visionOk; i++) {
+
+    visionOk = gv2Present();
+
+    if (!visionOk) delay(300);
+
+  }
+
+  Serial.println(visionOk ? F("OK") : F("NOT FOUND"));
+
+
+
+  showSettings();
+
+
+
+  armMoveTo(INITIAL_BASE, INITIAL_BOTTOM, INITIAL_TOP, 3000);
+
+  missionAborted = false;
+
+
+
+#if AUTO_START
+
+  Serial.println();
+
+  Serial.print(F("AUTO START in "));
+
+  Serial.print(AUTO_START_DELAY_MS / 1000);
+
+  Serial.println(F(" s. Send any key NOW to cancel and stay in TEST mode."));
+
+
+
+  unsigned long t0 = millis();
+
+  while (!anyKeySeen && millis() - t0 < AUTO_START_DELAY_MS) {
+
+    abortRequested();           // also notices any key
+
+    delay(10);
+
+  }
+
+
+
+  missionAborted = false;
+
+
+
+  if (!anyKeySeen) {
+
+    startMission();
+
+  } else {
+
+    Serial.println(F("AUTO START cancelled. TEST mode: wheels stay still."));
+
+  }
+
+#endif
+
+
+
+  Serial.println(F("READY. Press the button or send P to start Mission 1."));
+
+}
+
+
+
+void loop() {
+
+  checkSerial();
+
+  checkStartButton();
+
+}

@@ -1,0 +1,476 @@
+// ======================================================
+// Mission.ino  -  REPLAY: pick each patient exactly where it was taught
+// ======================================================
+#include "Config.h"
+
+// ---- DROP: the patient must let go at once ----
+#ifndef RELEASE_WAIT_MS
+#define RELEASE_WAIT_MS   1500   // arm stays DOWN this long after suction OFF
+#endif
+#ifndef RELEASE_WIGGLE
+#define RELEASE_WIGGLE       3   // small base shakes to break the vacuum (0 = off)
+#endif
+#ifndef RELEASE_WIGGLE_UNITS
+#define RELEASE_WIGGLE_UNITS 4
+#endif
+#ifndef PLACE_LIFT_MS
+#define PLACE_LIFT_MS     1500   // slow lift after the drop
+#endif
+
+unsigned long missionT0 = 0;
+byte dropCount[ZONE_COUNT] = {0, 0, 0, 0};
+byte patientsDone = 0;
+
+void missionReset() {
+  stepCounter = 0;
+  missionAborted = false;
+  patientsDone = 0;
+  navX = 0;
+  navY = 0;
+  for (byte z = 0; z < ZONE_COUNT; z++) dropCount[z] = 0;
+  missionT0 = millis();
+}
+
+// gyro must be there; calibrate while standing still. waitTotalMs = whole wait
+bool gyroStart(unsigned long waitTotalMs) {
+#if USE_MPU
+  if (!mpuOk) mpuBegin();
+#if MPU_REQUIRED
+  if (!mpuOk) {
+    Serial.println(F("!!! GYRO (MPU6050) not found - not started. Send i2c."));
+    return false;
+  }
+#endif
+#endif
+  Serial.println(F("Gyro calibrating - do not touch the robot..."));
+  unsigned long w0 = millis();
+  if (!waitMs(600)) return false;
+#if USE_MPU
+  bool cal = false;
+  for (int i = 0; i < 3 && !cal; i++) {
+    cal = mpuCalibrate();
+    if (!cal && !waitMs(600)) return false;
+  }
+  headingRef = yawDeg;
+#endif
+  unsigned long used = millis() - w0;
+  if (waitTotalMs > used) {
+    Serial.print(F("Waiting "));
+    Serial.print((waitTotalMs - used) / 1000);
+    Serial.println(F(" s..."));
+    if (!waitMs(waitTotalMs - used)) return false;
+  }
+  return true;
+}
+
+// look from the scan pose at this base; small arm sweep if not seen
+static bool lookAt(int base, int &x, int &y) {
+  static const int8_t OFF[5] = {0, 12, -12, 24, -24};
+  for (byte k = 0; k < 5; k++) {
+    if (k > 0) {
+      Serial.print(F("   not seen - arm sweep "));
+      Serial.println(OFF[k]);
+    }
+    if (!armScanAt(base + OFF[k])) return false;
+    if (!waitMs(SETTLE_MS)) return false;
+    if (lookForSample(x, y, LOOK_MS)) return true;
+    if (missionAborted) return false;
+  }
+  return false;
+}
+
+// colour only (no pick). Robot must be at the slot.
+bool lookSlot(byte s, PatientColor &c) {
+  SlotData &sd = st.slot[s];
+  Pose3 p = sd.ok ? sd.pick : slotDefaultPose(s);
+  setAim(sd.hasPix ? sd.px : IMAGE_CENTER_X, sd.hasPix ? sd.py : IMAGE_CENTER_Y);
+  int x, y;
+  c = lookAt(p.b, x, y) ? lastColor : COL_NONE;
+  return !missionAborted;
+}
+
+static float fineWheelMM = 0;   // wheel correction done for this patient (mm, + = left)
+
+// Bring the CENTRE of the patient box (x, y, w, h) onto the target pixel:
+//   target = pixel recorded in teach  (or the picture middle if ALIGN_TO_IMAGE_CENTER 1)
+//   arm base turn  -> moves the picture one way
+//   wheel strafe   -> moves the picture the other way (if learned in teach)
+static bool fineCorrect(byte s, int base0, int &x, int &y) {
+#if FINE_ENABLE
+  SlotData &sd = st.slot[s];
+#if ALIGN_TO_IMAGE_CENTER
+  int tx = IMAGE_CENTER_X, ty = IMAGE_CENTER_Y;
+#else
+  if (!sd.hasPix) return true;
+  int tx = sd.px, ty = sd.py;
+#endif
+  if (!st.baseCal) return true;
+
+  float bx = st.bx, by = st.by;
+  float sx = st.sx[s], sy = st.sy[s];
+  float n2 = bx * bx + by * by;
+  float det = bx * sy - by * sx;
+  bool wheels = FINE_WHEELS && st.strafeCal[s] && fabs(det) > 0.05 * sqrt(n2 * (sx * sx + sy * sy));
+  float pxPerMm = st.strafeCal[s] ? sqrt(sx * sx + sy * sy) : 0;
+
+  setAim(tx, ty);
+  for (byte r = 0; r <= FINE_ROUNDS; r++) {
+    int w, h;
+    if (!lookPrecise(x, y, w, h, ALIGN_LOOK_MS)) return !missionAborted;
+    float ex = tx - x, ey = ty - y;
+    Serial.print(F("   FINE: error dx="));
+    Serial.print(ex, 0);
+    Serial.print(F(" dy="));
+    Serial.print(ey, 0);
+    Serial.print(F(" px"));
+    if (pxPerMm > 0.05) {
+      Serial.print(F("  (~"));
+      Serial.print(sqrt(ex * ex + ey * ey) / pxPerMm, 1);
+      Serial.print(F(" mm)"));
+    }
+    Serial.println();
+    if (fabs(ex) <= FINE_TOL_PX && fabs(ey) <= FINE_TOL_PX) return true;
+    if (r == FINE_ROUNDS) break;
+
+    // split the error into "turn the base" (u units) and "strafe" (v mm)
+    float u, v = 0;
+    if (wheels) {
+      u = (ex * sy - ey * sx) / det;
+      v = (bx * ey - by * ex) / det;
+    } else {
+      u = (bx * ex + by * ey) / n2;
+    }
+    u *= FINE_GAIN;
+    v *= FINE_GAIN;
+
+    bool moved = false;
+    float nb = constrain(armBase + u, base0 - FINE_MAX_UNITS, base0 + FINE_MAX_UNITS);
+    if (fabs(nb - armBase) >= 0.5) {
+      if (!armScanAt((int)(nb + 0.5))) return false;
+      moved = true;
+    }
+    if (wheels && fabs(v) >= FINE_WHEEL_MIN_MM) {
+      float nv = constrain(fineWheelMM + v, -FINE_MAX_MM, FINE_MAX_MM);
+      float dv = nv - fineWheelMM;
+      if (fabs(dv) >= FINE_WHEEL_MIN_MM) {
+        if (!smallMove(dv > 0 ? STRAFE_LEFT : STRAFE_RIGHT, fabs(dv))) return false;
+        if (!fixHeading()) return false;
+        navY += dv;              // so the way back to H CENTER stays right
+        fineWheelMM = nv;
+        moved = true;
+      }
+    }
+    if (!moved) return true;     // at the limit - nothing more to do
+    if (!waitMs(SETTLE_MS)) return false;
+  }
+#else
+  (void)s; (void)base0; (void)x; (void)y;
+#endif
+  return true;
+}
+
+// strafe the robot a few mm for the search pattern (+ = left)
+static bool pickShift(float mm) {
+  if (!smallMove(mm > 0 ? STRAFE_LEFT : STRAFE_RIGHT, fabs(mm))) return false;
+  if (!fixHeading()) return false;
+  navY += mm;                      // so the way back to H CENTER stays right
+  return true;
+}
+
+// how many arm-base units move the nozzle about PICK_STEP_MM
+// (from the teach calibration; without it PICK_STEP_BASE is used)
+static float baseStepUnits(byte s) {
+  if (st.baseCal && st.strafeCal[s]) {
+    float pxPerUnit = sqrt(st.bx * st.bx + st.by * st.by);
+    float pxPerMm = sqrt(st.sx[s] * st.sx[s] + st.sy[s] * st.sy[s]);
+    if (pxPerUnit > 0.05) return constrain(PICK_STEP_MM * pxPerMm / pxPerUnit, 1.0, 6.0);
+  }
+  return PICK_STEP_BASE;
+}
+
+// FIND + PICK + CHECK. c = colour (COL_NONE = nothing picked). false = stopped
+bool pickSlot(byte s, PatientColor &c) {
+  c = COL_NONE;
+  fineWheelMM = 0;
+  SlotData &sd = st.slot[s];
+  Pose3 p = sd.ok ? sd.pick : slotDefaultPose(s);
+  if (!sd.ok) Serial.println(F("!! slot NOT taught - using the default pose (send: teach N)"));
+
+  int aimX = sd.hasPix ? sd.px : IMAGE_CENTER_X;
+  int aimY = sd.hasPix ? sd.py : IMAGE_CENTER_Y;
+  setAim(aimX, aimY);
+
+  int x, y;
+  if (!lookAt(p.b, x, y)) {
+    if (missionAborted) return false;
+    Serial.println(F("NO PATIENT on this slot"));
+    return true;
+  }
+  PatientColor seen = lastColor;
+  Serial.print(F("COLOUR: "));
+  Serial.println(colorName(seen));
+
+  // SEARCH PATTERN around the aimed point (brute force).
+  //   column 1: arm base  (x bStep units  = moves the nozzle along the arc, ~PICK_STEP_MM)
+  //   column 2: wheels    (x PICK_STEP_MM = strafe left + / right -)
+  //
+  //        7      2      5            1 = aimed point
+  //        3      1      4            2..8 = PICK_STEP_MM around it
+  //        8      9*     6            (* 9 = only with PICK_MAX_TRIES 9)
+  static const int8_t PAT[9][2] = {
+    { 0,  0},   // 1 aimed point
+    { 0,  1},   // 2 strafe left
+    {-1,  0},   // 3 base -
+    { 1,  0},   // 4 base +
+    { 1,  1},   // 5 diagonal
+    { 1, -1},   // 6 diagonal
+    {-1,  1},   // 7 diagonal
+    {-1, -1},   // 8 diagonal
+    { 0, -1},   // 9 strafe right
+  };
+  byte tries = PICK_MAX_TRIES > 9 ? 9 : PICK_MAX_TRIES;
+  float bStep = baseStepUnits(s);
+  bool picked = false;
+
+  for (byte a = 0; a < tries && !picked; a++) {
+    // aim at the patient again first (the last try may have pushed it)
+    if (!fineCorrect(s, p.b, x, y)) return false;
+    float base0 = (FINE_ENABLE && (sd.hasPix || ALIGN_TO_IMAGE_CENTER) && st.baseCal) ? armBase : p.b;
+
+    float base = base0 + PAT[a][0] * bStep;
+    float shift = PICK_SHIFT_WHEELS ? PAT[a][1] * (float)PICK_STEP_MM : 0;
+    float pb = p.bo + (a > 0 ? PICK_RETRY_PRESS : 0);    // retries press a little lower
+    float pt = p.t;
+
+    Serial.print(F("===> PICK TRY "));
+    Serial.print(a + 1);
+    Serial.print('/');
+    Serial.print(tries);
+    Serial.print(F("   base "));
+    Serial.print(base - base0, 1);
+    Serial.print(F(" units   wheels "));
+    Serial.print(shift, 0);
+    Serial.println(F(" mm"));
+
+    if (shift != 0 && !pickShift(shift)) return false;
+
+    if (!armOver(base, pb, pt)) return false;
+    setSuction(true);
+    if (!armDown(base, pb, pt)) return false;
+    Serial.println(F("   nozzle on the patient - sucking..."));
+    if (!waitMs(PICK_DWELL_MS)) return false;
+    float hb = pb + HOVER_FRACTION * (st.scan.bo - pb);
+    float ht = pt + HOVER_FRACTION * (st.scan.t - pt);
+    if (!armMoveTo((int)(base + 0.5), (int)(hb + 0.5), (int)(ht + 0.5), PICK_LIFT_MS)) return false;
+
+    // back to the aimed point, so the camera check looks at the same place
+    if (!armScanAt((int)(base0 + 0.5))) return false;
+    if (shift != 0 && !pickShift(-shift)) return false;
+    if (!waitMs(VERIFY_SETTLE_MS)) return false;
+
+    // search circle: at least VERIFY_RADIUS_PX, bigger for a big patient (w / h)
+    int size = lastBoxW > lastBoxH ? lastBoxW : lastBoxH;
+    int radius = (int)(VERIFY_RADIUS_SIZE * size);
+    if (radius < VERIFY_RADIUS_PX) radius = VERIFY_RADIUS_PX;
+
+    int vx = x, vy = y;
+    int r = pickCheck(x, y, radius, vx, vy);
+    if (missionAborted) return false;
+    if (r == 1) {
+      Serial.println(F("CHECK: gone from the floor -> PICK OK"));
+      picked = true;
+    } else {
+      Serial.println(r == 0 ? F("CHECK: -> NOT picked, again")
+                            : F("CHECK: no proof -> treat as NOT picked, again"));
+      setSuction(false);
+      if (!waitMs(400)) return false;
+      x = vx;                    // aim at where it is now (it may have been pushed)
+      y = vy;
+      setAim(x, y);
+    }
+  }
+
+  if (!picked) {
+    Serial.println(F("!!! PICK FAILED - going on"));
+    setSuction(false);
+    return true;
+  }
+  c = seen;
+  return true;
+}
+
+// drive to the zone and drop. Ends in INITIAL.
+bool placeInZone(Zone z, byte k, byte n) {
+  if (!navToZone(z, k)) return false;
+  if (!mgate(F("PLACE"))) return false;
+  Pose3 p = st.zone[z].place;
+  if (!st.zone[z].ok) Serial.println(F("!! zone NOT taught - default place pose (send: tz ...)"));
+  if (!armOver(p.b, p.bo, p.t)) return false;
+  if (!armDown(p.b, p.bo, p.t)) return false;
+
+  // RELEASE: pump OFF (sent twice), arm stays down, shake a little, wait
+  setSuction(false);
+  delay(30);
+  setSuction(false);
+  if (!waitMs(300)) return false;
+  for (byte w = 0; w < RELEASE_WIGGLE; w++) {
+    if (!armMoveTo(p.b + RELEASE_WIGGLE_UNITS, p.bo, p.t, 120)) return false;
+    if (!armMoveTo(p.b - RELEASE_WIGGLE_UNITS, p.bo, p.t, 120)) return false;
+  }
+  if (!armMoveTo(p.b, p.bo, p.t, 120)) return false;
+  if (!waitMs(RELEASE_WAIT_MS)) return false;
+
+  // slow lift so the patient stays on the floor
+  {
+    float hb = p.bo + HOVER_FRACTION * (st.scan.bo - p.bo);
+    float ht = p.t  + HOVER_FRACTION * (st.scan.t  - p.t);
+    if (!armMoveTo(p.b, (int)(hb + 0.5), (int)(ht + 0.5), PLACE_LIFT_MS)) return false;
+  }
+  if (!armToInitial()) return false;
+  Serial.print(F("PLACED patient "));
+  Serial.print(n);
+  Serial.print(F(" in "));
+  Serial.println(zoneName(z));
+  return true;
+}
+
+// FROM H CENTER: slot -> pick -> H CENTER -> zone -> place -> H CENTER
+bool processSlot(byte s) {
+  bool right = slotIsRight(s);
+  Serial.println();
+  Serial.print(F("########## PATIENT SLOT "));
+  Serial.print(s + 1);
+  Serial.print(F("   [t="));
+  Serial.print((millis() - missionT0) / 1000);
+  Serial.println(F(" s] ##########"));
+
+  if (!armToInitial()) return false;
+  if (!navToSlot(s)) return false;
+  if (!mgate(F("PICK"))) return false;
+
+  PatientColor c;
+  if (!pickSlot(s, c)) return false;
+
+  if (c == COL_NONE) {
+    if (!armToInitial()) return false;
+    return navReturnNode();
+  }
+  if (!navReturnNode()) return false;
+
+  Zone z = zoneFor(c, right);
+  Serial.print(colorName(c));
+  Serial.print(F(" -> "));
+  Serial.println(zoneName(z));
+  if (!placeInZone(z, dropCount[z], s + 1)) return false;
+  dropCount[z]++;
+  patientsDone++;
+  return navReturnNode();
+}
+
+bool deliverKits() {
+  if (!mgate(F("=== KITS ==="))) return false;
+  if (!armToInitial()) return false;
+  if (!navToZone(ZONE_HOSPITAL, 0)) return false;
+  if (!kitRelease(ZONE_HOSPITAL)) return false;
+  if (st.kitsPCC) {
+    if (!navToZone(ZONE_PCC1, 0)) return false;
+    if (!kitRelease(ZONE_PCC1)) return false;
+    if (!navToZone(ZONE_PCC2, 0)) return false;
+    if (!kitRelease(ZONE_PCC2)) return false;
+  }
+  return navReturnNode();
+}
+
+bool runFromNode(bool kits) {
+  if (kits && !deliverKits()) return false;
+  for (byte s = 0; s < SLOT_COUNT; s++)
+    if (!processSlot(s)) return false;
+  setSuction(false);
+  armToInitial();
+  return true;
+}
+
+// COMPETITION: start zone -> wait -> H CENTER -> kits -> 12 patients
+bool runMission() {
+  missionReset();
+  Serial.println(F("############ MISSION 2 START ############"));
+  setSuction(false);
+  kitsHoldAll();
+  if (!armToInitial()) return false;
+  if (!gyroStart(START_DELAY_MS)) return false;
+  missionT0 = millis();
+  if (!navStartToNode()) return false;
+  if (!runFromNode(RUN_KITS)) return false;
+  Serial.println(F("############ MISSION 2 COMPLETE ############"));
+  printSummary();
+  return true;
+}
+
+// MOVEMENT ONLY: H CENTER -> each zone -> H CENTER (no arm, no pick)
+bool zoneTour() {
+  const Zone order[4] = {ZONE_HOSPITAL, ZONE_PCC1, ZONE_PCC2, ZONE_RECOVERY};
+  if (!armToInitial()) return false;
+  for (byte i = 0; i < 4; i++) {
+    if (!mgate(zoneName(order[i]))) return false;
+    if (!navToZone(order[i], 0)) return false;
+    Serial.print(F("   at "));
+    Serial.println(zoneName(order[i]));
+    if (!waitMs(1500)) return false;
+    if (!navReturnNode()) return false;
+    Serial.println(F("   back on H CENTER"));
+    if (!waitMs(1000)) return false;
+  }
+  return true;
+}
+
+// MOVEMENT ONLY: H CENTER -> every slot -> H CENTER
+bool slotTour() {
+  if (!armToInitial()) return false;
+  for (byte s = 0; s < SLOT_COUNT; s++) {
+    if (!navToSlot(s)) return false;
+    if (!waitMs(1000)) return false;
+    if (!navReturnNode()) return false;
+  }
+  return true;
+}
+
+// colour of every slot, no pick (robot starts on H CENTER)
+void lookAll() {
+  PatientColor seen[SLOT_COUNT];
+  for (byte s = 0; s < SLOT_COUNT; s++) {
+    seen[s] = COL_NONE;
+    if (!armToInitial() || !navToSlot(s)) return;
+    if (!lookSlot(s, seen[s])) return;
+    Serial.print(F(">>> slot "));
+    Serial.print(s + 1);
+    Serial.print(F(": "));
+    Serial.println(colorName(seen[s]));
+    if (!armToInitial() || !navReturnNode()) return;
+  }
+  Serial.println(F("===== COLOUR CHECK ====="));
+  for (byte s = 0; s < SLOT_COUNT; s++) {
+    Serial.print(F("  slot "));
+    Serial.print(s + 1);
+    Serial.print(F(": "));
+    Serial.print(colorName(seen[s]));
+    if (seen[s] != COL_NONE) {
+      Serial.print(F(" -> "));
+      Serial.print(zoneName(zoneFor(seen[s], slotIsRight(s))));
+    }
+    Serial.println();
+  }
+}
+
+void printSummary() {
+  Serial.print(F("Patients delivered: "));
+  Serial.println(patientsDone);
+  for (byte z = 0; z < ZONE_COUNT; z++) {
+    Serial.print(F("   "));
+    Serial.print(zoneName((Zone)z));
+    Serial.print(F(": "));
+    Serial.println(dropCount[z]);
+  }
+  Serial.print(F("Time: "));
+  Serial.print((millis() - missionT0) / 1000);
+  Serial.println(F(" s"));
+}
